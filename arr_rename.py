@@ -1,0 +1,1210 @@
+#!/usr/bin/env python3
+"""Find Sonarr series and Radarr movie folders whose names don't match the arr's naming format, and rename them.
+
+"The arr" below means Sonarr or Radarr, whichever one the script is pointed at.
+
+What is checked
+  For each series or movie, the script asks the arr what its folder should be called (the arr's
+  /folder endpoint) and compares that with the folder's real name. Capitals count as a difference,
+  unless --ignore-case is given, and so do special characters (anything other than letters, digits
+  and spaces, outside the year and id tags), unless --ignore-punctuation is given. Each mismatch
+  says what is different: the title, the year, an id tag ({tvdb-...}, {tmdb-...}, {imdb-...} or
+  {tvmaze-...}) that doesn't match the arr's id, or only the capitals. The two options apply to
+  file names in the same way: a file rename that only changes what they ignore is skipped.
+
+How a folder is renamed (only with --apply or --interactive)
+  1. The item is refreshed in the arr, and the script waits for that to finish. A failed refresh
+     stops the run.
+  2. The item is checked again. If it no longer needs renaming, it's skipped. If the new name has
+     changed, the new one is used.
+  3. Half a second later, the folder is renamed the same way the arr's web page does it: the
+     item's root folder is "changed" to the one it's already in, with "move files" on, so the arr
+     moves the folder to <root folder>/<correct name>.
+  4. The script waits for the move to finish, then compares the files before and after, both on
+     disk (as the arr sees them) and in the arr's records. If the records don't match the files,
+     it asks the arr to refresh, and logs that.
+  5. It waits 2 seconds before contacting the arr again.
+  Any problem stops the whole run, including an arr command still running after an hour, so
+  nothing else gets moved until you've looked at it.
+
+File names
+  When a folder is renamed, its files are renamed too, to the names the arr's rename preview gives
+  them, so they pick up the new title and year. This is done with the arr's RenameFiles command
+  once the folder has been moved and checked, and the files are compared before and after in the
+  same way.
+  --files checks the files of every item, so files are renamed even when their folder is fine.
+  --tba (Sonarr only) does the same, but only for files whose episode title was "TBA" and now has
+  a real title, and only when that's the only change. Less clear cases, such as a new title with
+  TBA in it ("This episode title is TBA", "FOOTBALL"), are marked TBA? and, like irregular
+  folders, only renamed with --interactive.
+
+Irregular renames
+  If the new name would lose something the current folder name has (its year, an id tag or the
+  title), the arr is probably missing some information. The rename is marked IRREGULAR and only
+  done with --interactive, after asking you.
+
+Options
+  By default this is a dry run: nothing is changed. --apply does every rename, and --interactive
+  asks you about each one. --apply --force also does the renames that would otherwise need
+  --interactive (irregular folders and TBA? files) and marks them FORCED. Folders that can't be
+  renamed, for example because their new name is already taken, are still skipped.
+  Series and movies with the tag given by --ignore-tag (or SONARR_IGNORE_TAG / RADARR_IGNORE_TAG)
+  are left alone.
+
+Log and Discord
+  Everything the script prints, and your answers to its questions, also go into
+  logs/arr_rename.log next to the script, with the time each run started and ended.
+  If a Discord webhook is set (DISCORD_WEBHOOK_URL or --discord-webhook), each run posts a report:
+  whether it was a dry run, and one entry per rename (done, or still to do) showing the old and
+  new folder name and the file names under it. If the run can't start (the arr can't be reached,
+  it refuses the API key, the --ignore-tag doesn't exist, ...), the reason goes in the log and in
+  a red Discord post, before anything is changed.
+
+Settings
+  Each one is read from the environment, or else from a .env file next to the script, with one
+  KEY=value per line (keep it private: chmod 600 .env). Command-line options win over both.
+    SONARR_URL, SONARR_API_KEY    e.g. SONARR_URL=http://192.168.1.10:8989
+    RADARR_URL, RADARR_API_KEY    e.g. RADARR_URL=http://192.168.1.10:7878
+    SONARR_IGNORE_TAG             optional: leave series with this tag alone (--ignore-tag)
+    RADARR_IGNORE_TAG             optional: leave movies with this tag alone (--ignore-tag)
+    DISCORD_WEBHOOK_URL           optional: post each run's results to this Discord webhook
+                                  (Server Settings > Integrations > Webhooks)
+    DISCORD_USER_ID               optional: your Discord user id, pinged when renames need an
+                                  --interactive run or were forced, or a run can't start. Turn on
+                                  Developer Mode (Settings > Advanced), then right-click your name >
+                                  Copy User ID.
+
+Examples
+    ./arr_rename.py sonarr     # dry run; reads SONARR_URL and SONARR_API_KEY (or .env)
+    ./arr_rename.py radarr -i  # ask about each rename; reads RADARR_URL and RADARR_API_KEY
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import posixpath
+import re
+import shlex
+import subprocess
+import sys
+import time
+import traceback
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import NamedTuple
+
+THROTTLE = 2.0  # seconds to wait after a rename (and its checks) before contacting the arr again
+SETTLE = 0.5    # seconds to wait between refreshing an item and renaming it
+POLL = 1.0      # seconds between checks on whether an arr command has finished
+TIMEOUT = 3600  # seconds to wait for an arr command before giving up; giving up stops the run
+BUSY = ("queued", "started")
+FOLDER_FILES = 2  # Discord: files listed under a renamed folder before "… and N more files"
+FILES_ONLY = 13   # Discord: files listed (per list) when only an item's files are renamed (--files or --tba)
+# The differences --ignore-case and --ignore-punctuation can skip: (how the log describes it, the option)
+IGNORABLE = {"capitals": ("capitals", "--ignore-case"),
+             "punctuation": ("special characters", "--ignore-punctuation")}
+
+ID_TAG = re.compile(r"[\[{](tvdb|tmdb|tvmaze|imdb)(?:id)?[-=](tt\d+|\d*)[\]}]", re.IGNORECASE)
+ID_FIELDS = {"tvdb": "tvdbId", "tmdb": "tmdbId", "tvmaze": "tvMazeId", "imdb": "imdbId"}  # where the arr keeps each id
+YEAR = re.compile(r"\((\d{4})\)")
+# A special character (removed by unpunctuated), or an id tag or year (kept as they are)
+SPECIAL = re.compile(rf"({ID_TAG.pattern}|{YEAR.pattern})|[^\w\s]|_", re.IGNORECASE)
+# A "(1)" or "Part 1" ending, which Sonarr leaves out when it puts several episode titles in one file name
+MULTI_PART = re.compile(r":?\s?(?:\(\d+\)|(?:Part|Pt\.?)\s?\d+)$", re.IGNORECASE)
+
+
+class Kind(NamedTuple):
+    items: str      # API name for the items: series / movie
+    files: str      # API name for their files: episodefile / moviefile
+    file_param: str  # query parameter that picks one item's files: seriesId / movieId
+    ids_field: str  # field that lists item ids when moving or refreshing: seriesIds / movieIds
+    move: str       # name of the arr command that moves folders
+    refresh: str    # name of the arr command that refreshes and rescans one item
+    file_id: str    # name of the file id field in the arr's rename preview
+
+
+KINDS = {
+    "sonarr": Kind("series", "episodefile", "seriesId", "seriesIds", "BulkMoveSeries", "RefreshSeries", "episodeFileId"),
+    "radarr": Kind("movie", "moviefile", "movieId", "movieIds", "BulkMoveMovie", "RefreshMovie", "movieFileId"),
+}
+
+
+class Mismatch(NamedTuple):
+    item: dict
+    expected: str          # the folder name the arr says it should have
+    problems: list[str]    # what's wrong with the folder name; empty if nothing (or only ignored differences)
+    irregular: list[str]   # what the new name would lose from the current one; --apply never does these
+    blocker: str | None    # why the folder can't be renamed, if it can't
+    files: tuple = ()      # files to rename, as (file id, old name, new name), relative to the folder
+    unsure: tuple = ()     # --tba only: file renames that may be more than a TBA title being filled in
+    ignored: tuple = ()    # differences an --ignore-... option skipped: "capitals" and/or "punctuation"
+    skipped: tuple = ()    # file renames an --ignore-... option skipped: (file id, old, new, those differences)
+    # How many files are in the folder, if it's going to be renamed. It's the last field so it can be
+    # left out when checking whether a refresh changed the plan.
+    count: int = 0
+
+
+class Arr:
+    def __init__(self, url: str, api_key: str):
+        self.url = url.rstrip("/")
+        self.api_key = api_key
+
+    def call(self, method: str, endpoint: str, body=None, params=None):
+        url = self.url + endpoint + (f"?{urllib.parse.urlencode(params)}" if params else "")
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "X-Api-Key": self.api_key, "Content-Type": "application/json", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:  # add the arr's explanation: the status line alone doesn't say what's wrong
+            reason = " ".join(e.read().decode(errors="replace").split())[:300]
+            raise OSError(f"HTTP Error {e.code}: {e.reason} ({method} {endpoint})" + (f": {reason}" if reason else "")) from e
+        except OSError as e:  # couldn't connect, or the connection dropped: say to which server and request
+            raise OSError(f"couldn't reach {self.url} ({method} {endpoint}): {getattr(e, 'reason', e)}") from e
+        return json.loads(raw) if raw else None
+
+    def get(self, endpoint: str, **params):
+        return self.call("GET", endpoint, params=params)
+
+
+def fold(s: str) -> str:
+    """`s` in lower case, with its accents stored one way. An accented letter like "é" can be one
+    character or a letter plus an accent mark (as Macs often store file names); both look the same."""
+    return unicodedata.normalize("NFC", s).casefold()
+
+
+def lowered(s: str) -> str:
+    """Like fold, but only lowers capitals: fold also matches different spellings, such as "ß" with
+    "ss" ("Weiße" and "Weisse"), which is safe for spotting clashes but isn't a capitals change."""
+    return unicodedata.normalize("NFC", s).lower()
+
+
+def id_value(v):
+    """An id in a form that can be compared: a number, or for other ids (like IMDb's "tt...", or ""
+    when missing) the text in lower case."""
+    return int(v) if isinstance(v, str) and v.isdigit() else v.casefold() if isinstance(v, str) else v
+
+
+def item_id(item: dict, k: str):
+    """The `k` id ("tvdb", "imdb", ...) the arr has for `item`, or None if it has none."""
+    return id_value(item.get(ID_FIELDS[k])) or None
+
+
+def parse(folder: str):
+    """Split a folder name into its title, year and id tags: (title, year, {"tvdb": id, ...}). The
+    title is in lower case, for comparing."""
+    ids = {k.lower(): id_value(v) for k, v in ID_TAG.findall(folder)}
+    rest = ID_TAG.sub("", folder)
+    years = list(YEAR.finditer(rest))
+    year = None
+    if years:
+        year = int(years[-1].group(1))
+        rest = rest[:years[-1].start()] + rest[years[-1].end():]
+    return " ".join(lowered(rest).split()), year, ids
+
+
+def unpunctuated(name: str) -> str:
+    """`name` with its special characters (anything other than letters, digits and spaces) removed,
+    except in its year and id tags, and runs of spaces made single: "What's Up! (2020)" becomes
+    "Whats Up (2020)"."""
+    return " ".join(SPECIAL.sub(lambda m: m.group(1) or "", name).split())
+
+
+def passed_over(folder: str, expected: str) -> tuple[str, ...]:
+    """Why problems() let `folder` through although it isn't exactly the arr's `expected` name:
+    ("capitals",) if only capitals differ, ("punctuation",) if only special characters differ, or
+    both. () if the names are identical."""
+    if folder == expected:
+        return ()
+    if lowered(folder) == lowered(expected):
+        return ("capitals",)
+    if unpunctuated(folder) == unpunctuated(expected):
+        return ("punctuation",)
+    return ("punctuation", "capitals")
+
+
+def problems(folder: str, expected: str, item: dict, ignore_case: bool = False,
+             ignore_punctuation: bool = False) -> tuple[list[str], list[str]]:
+    """Compare `folder` with the arr's `expected` name. Returns two lists: what's wrong with the
+    current name, and what the new name would lose (which makes the rename irregular). Both are
+    empty if the names match. With `ignore_case`, a difference only in capitals doesn't count, and
+    with `ignore_punctuation`, neither does one only in special characters (see unpunctuated)."""
+    a, b = (unpunctuated(folder), unpunctuated(expected)) if ignore_punctuation else (folder, expected)
+    if a == b:
+        return [], []
+    if lowered(a) == lowered(b):  # the same apart from capitals and/or how accents are stored (see fold)
+        out = ["accents encoded differently"] if a.lower() != b.lower() else []
+        if not ignore_case and unicodedata.normalize("NFC", a) != unicodedata.normalize("NFC", b):
+            out.append("capitals differ")
+        return out, []
+    title, year, ids = parse(folder)
+    want_title, want_year, want_ids = parse(expected)
+    out = []
+    if title != want_title:
+        out.append(f"title {title!r} should be {want_title!r}")
+    if year is not None and want_year is not None and year != want_year:
+        out.append(f"year {year} should be {want_year}")
+    elif year is None and want_year is not None:
+        out.append("no year")
+    for k, v in ids.items():
+        if item_id(item, k) and v != item_id(item, k):
+            out.append(f"{k} id {v} should be {item_id(item, k)}" if v else f"empty {k} id")
+    out += [f"no {k} id" for k in want_ids if k not in ids]
+    irregular = []
+    if title and not want_title:
+        irregular.append("the new name has no title")
+    if year is not None and want_year is None:
+        irregular.append(f"the new name drops the year {year}")
+    irregular += [f"the new name drops the {k} id {v}" for k, v in ids.items() if k not in want_ids]
+    irregular += [f"the new name has an empty {k} id" for k, v in want_ids.items() if not v]
+    return out or ["formatted differently"], irregular
+
+
+def listing(arr: Arr, parent: str) -> set:
+    """The names of the folders inside `parent`, as the arr sees them (none if `parent` doesn't exist)."""
+    dirs = arr.get("/api/v3/filesystem", path=parent + "/").get("directories", [])
+    return {d["name"] for d in dirs}
+
+
+def only_change(old: str, new: str) -> tuple[str, str]:
+    """The part of `old` that was replaced to make `new`, and what replaced it, both widened to whole
+    words: "S01E01 - TBA.mkv" -> "S01E01 - Pilot.mkv" gives ("TBA", "Pilot")."""
+    p = 0
+    while p < min(len(old), len(new)) and old[p] == new[p]:
+        p += 1
+    while p and old[p - 1].isalnum():
+        p -= 1
+    s = 0
+    while s < min(len(old), len(new)) - p and old[-1 - s] == new[-1 - s]:
+        s += 1
+    while s and old[len(old) - s].isalnum():
+        s -= 1
+    return old[p:len(old) - s], new[p:len(new) - s]
+
+
+def letters(s: str) -> str:
+    """`s` with only its letters and digits, in lower case, for loose comparisons."""
+    return re.sub(r"[\W_]", "", s).casefold()
+
+
+def just_titles(text: str, titles) -> bool:
+    """Whether `text` is nothing but the episode `titles` (in episode order), the way Sonarr writes
+    them in a file name. Capitals and anything other than letters and digits are ignored, so
+    "World's" matches "Worlds". `text` may be one title, or all of them for a file holding several
+    episodes, either joined together or merged the way Sonarr merges them: without the "(1)" /
+    "Part 1" endings, and each title once ("Pilot (1)" + "Pilot (2)" -> "Pilot"). If `text` ends in
+    "...", it may be any of these cut short to fit."""
+    titles = [t for t in titles if t and t != "TBA"]
+    merged = dict.fromkeys(MULTI_PART.sub("", t).strip() for t in titles)
+    forms = {letters(t) for t in titles} | {letters("".join(titles)), letters("".join(merged))}
+    got = letters(text)
+    if text.rstrip().endswith(("...", "…")):
+        return bool(got) and any(f.startswith(got) for f in forms)
+    return bool(got) and got in forms
+
+
+def tba_kind(old: str, new: str, titles) -> str | None:
+    """What kind of change renaming the file `old` to `new` is. `titles` are the file's episode titles.
+
+    "tba"     It only fills in an episode title that used to be "TBA". Either putting "TBA" back in
+              place of the titles in `new` gives exactly `old`, or the only change is the word
+              "TBA" being replaced by the titles (perhaps tidied up, see just_titles). Also, none
+              of the new titles may contain "TBA".
+    "unsure"  It looks TBA-related but isn't clear-cut: a new title contains "TBA" (like "This
+              episode title is TBA", or a word like "FOOTBALL"), a "TBA" disappears some other way
+              ("Mask. TBA Again" -> "Mask. Again"), more than the title changes ("TBA" -> "Pilot
+              [WEBDL-1080p]"; naming format changes are for --files), or there are no titles to
+              check against.
+    None      It has nothing to do with TBA, or only capitals and punctuation change ("TBA" ->
+              "Tba", "episode title" -> "Episode Title!")."""
+    old, new = posixpath.basename(old), posixpath.basename(new)
+    if letters(old) == letters(new):
+        return None
+    if any("TBA" in t and t not in old for t in titles):
+        return "unsure"
+    known = sorted({t for t in titles if t and t != "TBA"}, key=len, reverse=True)
+    # every title back to "TBA" in one go, longest first, so a short title can't match inside a longer one
+    back = re.sub("|".join(map(re.escape, known)), "TBA", new) if known else new
+    if back == old and back != new:
+        return "tba"
+    was, now = only_change(old, new)
+    if was == "TBA" and "TBA" not in now and just_titles(now, titles):
+        return "tba"
+    return "unsure" if old.count("TBA") > new.count("TBA") else None
+
+
+def tba_split(arr: Arr, series_id: int, renames) -> tuple[tuple, tuple]:
+    """Sort the file `renames` ((file id, old, new) each) into two groups: TBA titles being filled
+    in, and unsure ones (see tba_kind). Renames that have nothing to do with TBA are dropped."""
+    titles: dict[int, list] = {}
+    # in season and episode order, the order Sonarr uses for a file holding several episodes
+    for ep in sorted(arr.get("/api/v3/episode", seriesId=series_id),
+                     key=lambda e: (e.get("seasonNumber", 0), e.get("episodeNumber", 0))):
+        if ep.get("episodeFileId"):
+            titles.setdefault(ep["episodeFileId"], []).append(ep.get("title") or "")
+    kinds = [tba_kind(old, new, titles.get(i, [])) for i, old, new in renames]
+    return (tuple(r for r, k in zip(renames, kinds) if k == "tba"),
+            tuple(r for r, k in zip(renames, kinds) if k == "unsure"))
+
+
+def check(arr: Arr, kind: Kind, item: dict, files: str | None, taken: set, names: set,
+          ignore_case: bool = False, ignore_punctuation: bool = False) -> Mismatch | None:
+    """What needs renaming for `item`: its folder, its files, or both. None if nothing does.
+
+    `taken` holds the paths (in lower case) of every item in the arr, and `names` the folders next
+    to this one, so a new name can't clash with them. When the folder is renamed, every file in it
+    that needs a new name is renamed too. When it isn't, `files` decides which files are checked:
+    "all" checks every file, "tba" only those whose episode title was TBA and now has a real one
+    (see tba_kind), and None none.
+
+    With `ignore_case` / `ignore_punctuation`, a folder whose name only differs in capitals / special
+    characters isn't renamed. It's still returned, with the reason in `ignored`, so the log can
+    say it was skipped. File renames that only change those are skipped too, and listed in `skipped`
+    (--tba never renames for them anyway, see tba_kind)."""
+    parent, folder = posixpath.split(item["path"].rstrip("/"))
+    expected = arr.get(f"/api/v3/{kind.items}/{item['id']}/folder")["folder"]
+    found, irregular = problems(folder, expected, item, ignore_case, ignore_punctuation)
+    blocker, ignored = None, ()
+    if not found:
+        ignored = passed_over(folder, expected)
+    elif not expected.strip() or "/" in expected:
+        blocker = f"the arr gives an unusable folder name ({expected!r})"
+    # (a rename that only changes capitals keeps the item's own path, which isn't a clash)
+    elif fold(expected) != fold(folder) and fold(posixpath.join(parent, expected)) in taken:
+        blocker = "another series/movie in the arr already uses that folder"
+    elif fold(expected) in {fold(n) for n in names if n != folder}:  # ignoring capitals, to be safe
+        blocker = "a folder with that name already exists"
+    renames = unsure = ()
+    if files or (found and not blocker):
+        renames = tuple((r[kind.file_id], r["existingPath"], r["newPath"])
+                        for r in arr.get("/api/v3/rename", **{kind.file_param: item["id"]}))
+        if files == "tba" and not (found and not blocker) and renames:
+            renames, unsure = tba_split(arr, item["id"], renames)
+    skipped = tuple((i, old, new, passed_over(old, new)) for i, old, new in renames
+                    if not problems(old, new, {}, ignore_case, ignore_punctuation)[0])
+    renames = tuple(r for r in renames if r[0] not in {s[0] for s in skipped})
+    if not (found or renames or unsure or ignored or skipped):
+        return None
+    count = len(on_disk(arr, item["path"].rstrip("/"))) if found and not blocker else 0
+    return Mismatch(item, expected, found, irregular, blocker, renames, unsure, ignored, skipped, count)
+
+
+def plan(arr: Arr, kind: Kind, files: str | None = None, ignore_tag: int | None = None, ignore_case: bool = False,
+         ignore_punctuation: bool = False):
+    """Check every item in the arr. Returns four things: what needs renaming (a list of Mismatch),
+    the items whose folder isn't on disk, the items skipped because they have the tag `ignore_tag`
+    (a tag id), and the paths of every item in lower case."""
+    items = sorted(arr.get(f"/api/v3/{kind.items}"), key=lambda i: fold(i.get("sortTitle") or i["title"]))
+    taken = {fold(i["path"].rstrip("/")) for i in items}
+    listings: dict[str, set] = {}
+    mismatches, not_on_disk, ignored = [], [], []
+    for item in items:
+        if ignore_tag is not None and ignore_tag in item.get("tags", []):
+            ignored.append(item)
+            continue
+        parent, folder = posixpath.split(item["path"].rstrip("/"))
+        if parent not in listings:
+            listings[parent] = listing(arr, parent)
+        if folder not in listings[parent]:  # exact match: a folder with other capitals isn't the arr's
+            not_on_disk.append(item)
+            continue
+        m = check(arr, kind, item, files, taken, listings[parent], ignore_case, ignore_punctuation)
+        if m:
+            mismatches.append(m)
+    return mismatches, not_on_disk, ignored, taken
+
+
+def refresh(arr: Arr, kind: Kind, item_id: int) -> None:
+    """Ask the arr to refresh the item (reload its information and rescan its files) and wait until
+    that's done. Raises OSError if the refresh doesn't complete, since the arr's information may
+    then be out of date."""
+    cmd = arr.call("POST", "/api/v3/command", {"name": kind.refresh, kind.ids_field: [item_id]})
+    status = wait_for(arr, command_id=cmd["id"])
+    if status != "completed":
+        raise OSError(f"the arr's refresh ended as {status!r}, not 'completed' (see the arr's logs)")
+
+
+def recheck(arr: Arr, kind: Kind, m: Mismatch, files: str | None, taken: set,
+            ignore_case: bool = False, ignore_punctuation: bool = False) -> tuple[bool, Mismatch | None]:
+    """Refresh `m`'s item in the arr and check it again. Returns whether its folder is still on
+    disk, and what needs renaming now (None if nothing does)."""
+    item_id = m.item["id"]
+    refresh(arr, kind, item_id)
+    item = arr.get(f"/api/v3/{kind.items}/{item_id}")
+    parent, folder = posixpath.split(item["path"].rstrip("/"))
+    names = listing(arr, parent)  # read again: a rename earlier in this run may have used a name
+    if folder not in names:
+        return False, None
+    return True, check(arr, kind, item, files, taken, names, ignore_case, ignore_punctuation)
+
+
+def wait_for(arr: Arr, name: str = None, command_id: int = None) -> str | None:
+    """Wait until the arr command `command_id` has finished, or, given `name` instead, until no
+    command with that name is queued or running. Returns how `command_id` ended ("completed",
+    "failed", ...). Raises OSError if it still isn't done after TIMEOUT seconds, so a stuck command
+    stops the run instead of keeping it waiting forever."""
+    start = note = time.monotonic()
+    while True:
+        status = None
+        if command_id is not None:
+            cmd = arr.get(f"/api/v3/command/{command_id}")
+            status, name = cmd["status"], cmd.get("name")
+            busy = status in BUSY
+        else:
+            busy = any(c.get("name") == name and c.get("status") in BUSY for c in arr.get("/api/v3/command"))
+        if not busy:
+            return status
+        if time.monotonic() - start >= TIMEOUT:
+            raise OSError(f"the arr's {name} command still wasn't done after {TIMEOUT // 60} minutes "
+                          "(see System > Tasks in the arr)")
+        time.sleep(POLL)
+        if time.monotonic() - note >= 30:
+            note = time.monotonic()
+            print(f"    still waiting for the arr ({int(note - start)}s)")
+
+
+def tracked(arr: Arr, kind: Kind, item_id: int) -> dict:
+    """The files the arr has on record for the item, as {file id: path relative to its folder}."""
+    return {f["id"]: f["relativePath"] for f in arr.get(f"/api/v3/{kind.files}", **{kind.file_param: item_id})}
+
+
+def on_disk(arr: Arr, path: str) -> set:
+    """The video files under `path`, as the arr sees them on disk, relative to `path`."""
+    return {f["relativePath"] for f in arr.get("/api/v3/filesystem/mediafiles", path=path)}
+
+
+def listed(paths) -> str:
+    return "".join(f"\n        {p}" for p in sorted(paths))  # all of them: fixing things by hand needs the full list
+
+
+def rename(arr: Arr, kind: Kind, m: Mismatch) -> tuple[bool, str]:
+    """Rename one item's folder through the arr, then check no files went missing. Returns (ok,
+    label): (False, label) on any problem, and (True, "RESCAN NEEDED") if the arr's records needed
+    a refresh to match the files again."""
+    item_id = m.item["id"]
+    old = m.item["path"].rstrip("/")
+    parent = posixpath.dirname(old)
+    db_before = tracked(arr, kind, item_id)
+    disk_before = on_disk(arr, old)
+    missing_before = set(db_before.values()) - disk_before
+
+    arr.call("PUT", f"/api/v3/{kind.items}/editor",
+             {kind.ids_field: [item_id], "rootFolderPath": parent, "moveFiles": True})
+    wait_for(arr, kind.move)
+
+    new = arr.get(f"/api/v3/{kind.items}/{item_id}")["path"].rstrip("/")
+    if new == old:
+        print(f"    FAILED: the arr kept the old folder, so the move didn't happen (see the arr's logs). "
+              f"{len(on_disk(arr, old))} of {len(disk_before)} files are still there.")
+        return False, "FAILED"
+    disk_after = on_disk(arr, new)
+    left_behind = on_disk(arr, old)
+    if left_behind or disk_after != disk_before:
+        print(f"    FAILED: files didn't all arrive in {new}. Not refreshing, because a refresh would drop "
+              "the missing ones from the arr. Move them by hand, then refresh it in the arr.")
+        if left_behind:
+            print(f"    LEFT BEHIND in {old}:{listed(left_behind)}")
+        if disk_before - disk_after - left_behind:
+            print(f"    MISSING:{listed(disk_before - disk_after - left_behind)}")
+        return False, "FAILED"
+
+    db_after = tracked(arr, kind, item_id)
+    label = ""
+    if db_after != db_before:
+        label = "RESCAN NEEDED"
+        print(f"    NEEDS REFRESH: the arr had {len(db_before)} files on record before the move and "
+              f"{len(db_after)} after; refreshing {m.item['title']!r}")
+        refresh(arr, kind, item_id)
+        db_after = tracked(arr, kind, item_id)
+        print(f"    REFRESHED: the arr now has {len(db_after)} files on record")
+    lost = (set(db_before.values()) - missing_before) - set(db_after.values())
+    if lost:
+        print(f"    FAILED: the arr lost track of {len(lost)} files:{listed(lost)}")
+        return False, "FILES MISSING"
+    print(f"    done: now {posixpath.basename(new)} ({len(disk_after)} files, all accounted for)")
+    return True, label
+
+
+def rename_files(arr: Arr, kind: Kind, item_id: int, only: set | None = None) -> tuple[bool, str, tuple]:
+    """Rename an item's files with the arr's RenameFiles command (given `only`, just the files with
+    those ids), then check nothing went missing. Returns (ok, label, renamed), where `renamed` is
+    (file id, old, new) for each file renamed. Any problem gives (False, label, ()). The label is
+    "RESCAN NEEDED" if the arr's records needed a refresh to match the files."""
+    path = arr.get(f"/api/v3/{kind.items}/{item_id}")["path"].rstrip("/")
+    renames = {r[kind.file_id]: (r["existingPath"], r["newPath"])
+               for r in arr.get("/api/v3/rename", **{kind.file_param: item_id})
+               if only is None or r[kind.file_id] in only}
+    if not renames:
+        print("    files: nothing to rename any more")
+        return True, "", ()
+    db_before = tracked(arr, kind, item_id)
+    disk_before = on_disk(arr, path)
+    olds = {old for old, _ in renames.values()}
+
+    cmd = arr.call("POST", "/api/v3/command", {"name": "RenameFiles", kind.file_param: item_id, "files": list(renames)})
+    wait_for(arr, command_id=cmd["id"])
+
+    disk_after = on_disk(arr, path)
+    missing = [old for old, new in renames.values() if old not in disk_after and new not in disk_after]
+    missing += sorted((disk_before - olds) - disk_after)
+    not_renamed = [old for old, new in renames.values() if old in disk_after and new not in disk_after]
+    if missing:
+        print(f"    FAILED: {len(missing)} files are gone from {path}. Not refreshing, because a refresh would "
+              f"drop them from the arr:{listed(missing)}")
+        return False, "FILES MISSING", ()
+    if not_renamed:
+        print(f"    FAILED: {len(not_renamed)} files weren't renamed (see the arr's logs):{listed(not_renamed)}")
+        return False, "FAILED", ()
+
+    want = {i: renames[i][1] if i in renames else rel for i, rel in db_before.items()}
+    db_after = tracked(arr, kind, item_id)
+    label = ""
+    if db_after != want:
+        label = "RESCAN NEEDED"
+        print(f"    NEEDS REFRESH: the arr's records don't match the renamed files; refreshing")
+        refresh(arr, kind, item_id)
+        db_after = tracked(arr, kind, item_id)
+        print(f"    REFRESHED: the arr now has {len(db_after)} files on record")
+    lost = {rel for rel in want.values() if rel in disk_after} - set(db_after.values())
+    if lost:
+        print(f"    FAILED: the arr lost track of {len(lost)} files:{listed(lost)}")
+        return False, "FILES MISSING", ()
+    print(f"    done: renamed {len(renames)} files, all accounted for")
+    return True, label, tuple((i, old, new) for i, (old, new) in renames.items())
+
+
+def tally(noun: str, nouns: str, folders: int, moved: int, items: int, files: int) -> str:
+    """The two summary lines, e.g. "1 Series folder with 12 files" and "2 Series with file renames -
+    8 files total"."""
+    return (f"{folders} {noun} folder{'' if folders == 1 else 's'} with {moved} file{'' if moved == 1 else 's'}\n"
+            f"{items} {noun if items == 1 else nouns} with file renames - {files} file{'' if files == 1 else 's'} total")
+
+
+def ask(prompt: str, choices: str = "ynaq") -> str:
+    """Return one of `choices` (default y/n/a/q). Enter means no; a closed stdin or Ctrl-C means quit."""
+    while True:
+        try:
+            answer = input(prompt).strip().lower()[:1] or "n"
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "q"
+        if answer in choices:
+            return answer
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    apps = ap.add_subparsers(dest="app", required=True, metavar="{radarr,sonarr}", help="which arr to check")
+    for name in sorted(KINDS):
+        things = "series" if name == "sonarr" else "movies"
+        p, var = apps.add_parser(name, help=f"check the {things} in {name.capitalize()}"), name.upper()
+        p.add_argument("--url", help=f"{name.capitalize()} URL (default: ${var}_URL)")
+        p.add_argument("--api-key", help=f"its API key (default: ${var}_API_KEY)")
+        mode = p.add_mutually_exclusive_group()
+        mode.add_argument("--apply", action="store_true",
+                          help="do every rename, except irregular ones, which need -i (default is a dry run)")
+        mode.add_argument("-i", "--interactive", action="store_true",
+                          help="ask about each rename (y/n/all/quit) and do the ones you accept")
+        files = p.add_mutually_exclusive_group()
+        files.add_argument("--files", action="store_true",
+                           help="check the file names of everything, not only of renamed folders, and rename them")
+        if name == "sonarr":  # --tba is Sonarr only: movies don't have episode titles
+            files.add_argument("--tba", action="store_true",
+                               help="like --files, but only rename files whose episode title was TBA and now has one")
+        p.set_defaults(tba=False)
+        p.add_argument("--ignore-case", action="store_true",
+                       help="don't rename folders or files whose name only differs from the arr's in capitals")
+        p.add_argument("--ignore-punctuation", action="store_true",
+                       help="don't rename folders or files whose name only differs from the arr's in special "
+                            "characters, like ! ' : (anything but letters, digits and spaces, outside the year and "
+                            "id tags)")
+        p.add_argument("--force", action="store_true",
+                       help="with --apply, also do the renames that need -i (irregular folders, TBA? files)")
+        p.add_argument("--ignore-tag", metavar="TAG", help=f"leave {things} with this tag alone (default: ${var}_IGNORE_TAG)")
+        p.add_argument("--discord-webhook", default=os.environ.get("DISCORD_WEBHOOK_URL"), metavar="URL",
+                       help="post the results to this Discord webhook (default: $DISCORD_WEBHOOK_URL)")
+        p.add_argument("--discord-user", default=os.environ.get("DISCORD_USER_ID"), metavar="ID",
+                       help="Discord user id to ping when renames need an --interactive run (default: $DISCORD_USER_ID)")
+    args = ap.parse_args(argv)
+    if args.force and not args.apply:
+        ap.error("--force only works with --apply")
+    if args.discord_user and not args.discord_user.isdigit():
+        ap.error(f"the Discord user id must be a number (Copy User ID in Discord), not {args.discord_user!r}")
+    files_mode = "all" if args.files else "tba" if args.tba else None
+    prefix, arr_name = args.app.upper(), args.app.capitalize()
+    modes = ["folders"] + (["files"] if args.files else []) + (["tba"] if args.tba else [])
+    modes += ["ignore case"] if args.ignore_case else []
+    modes += ["ignore punctuation"] if args.ignore_punctuation else []
+    modes += ["force"] if args.force else []
+    modes.append("apply" if args.apply else "interactive" if args.interactive else "dry run")
+
+    def couldnt_start(reason: str):
+        """End a run that couldn't start: log the reason, post it to Discord with a ping (otherwise a
+        scheduled run nobody watches would fail unnoticed), and exit with code 1. Nothing has been
+        changed at this point."""
+        if args.discord_webhook:
+            try:
+                discord_send(args.discord_webhook, f"{arr_name} Renaminatorr: {', '.join(modes)}",
+                             f"**Couldn't start the run:** {discord_escape(reason)}", [], RED,
+                             script_footer(__file__), args.discord_user or "", "the run couldn't start")
+            except Exception as e:  # a Discord problem mustn't stop the reason being logged below
+                print(f"WARNING: couldn't post to Discord: {e if isinstance(e, OSError) else repr(e)}", file=sys.stderr)
+        sys.exit(f"Couldn't start the run: {reason}")
+
+    url = args.url or os.environ.get(f"{prefix}_URL")
+    api_key = args.api_key or os.environ.get(f"{prefix}_API_KEY")
+    if not (url and api_key):
+        couldnt_start(f"no {arr_name} URL or API key: set {prefix}_URL and {prefix}_API_KEY (e.g. in .env), "
+                      "or pass --url and --api-key")
+
+    arr = Arr(url, api_key)
+    try:
+        app = arr.get("/api/v3/system/status").get("appName", "")
+        if app.lower() != args.app:
+            couldnt_start(f"{url} is {f'{app}, ' if app else ''}not {arr_name}")
+        kind = KINDS[args.app]
+        print(f"Reading {kind.items} from {app}")
+        tag_name = args.ignore_tag or os.environ.get(f"{prefix}_IGNORE_TAG")
+        ignore_tag = None
+        if tag_name:
+            tags = {t["label"].lower(): t["id"] for t in arr.get("/api/v3/tag")}
+            if tag_name.lower() not in tags:
+                couldnt_start(f"{app} has no tag {tag_name!r}, so nothing would be ignored. "
+                              f"Its tags: {', '.join(sorted(tags)) or 'none'}")
+            ignore_tag = tags[tag_name.lower()]
+            print(f"Ignoring {kind.items} tagged {tag_name!r}")
+        mismatches, not_on_disk, ignored, taken = plan(arr, kind, files_mode, ignore_tag, args.ignore_case,
+                                                       args.ignore_punctuation)
+    except Exception as e:  # e.g. the arr can't be reached, refuses the API key, or sends a reply we can't read
+        if not isinstance(e, OSError):
+            traceback.print_exc()  # not a connection problem, so maybe a bug: put the details in the log
+        couldnt_start(str(e) if isinstance(e, OSError) else repr(e))
+
+    changing = args.apply or args.interactive
+    # The Discord entries, as (title, diff): renames left for --interactive, and renames done (in a dry run, to do)
+    not_renamed, renames = [], []
+
+    def change(m: Mismatch, folder: bool, note: str = "", took_unsure: bool = False, held: bool = False) -> None:
+        """Add `m` to the Discord report. What gets renamed goes in `renames`, with `note` after the
+        title (like " - FAILED"). What's left for --interactive goes in `not_renamed`: the whole
+        item if `held` (an irregular folder that wasn't renamed), and its TBA? files unless
+        `took_unsure` (they were renamed). An irregular folder's entry says what the new name
+        loses, both when it's held and when --force renamed it anyway."""
+        title = discord_escape(m.item["title"])
+        old = posixpath.basename(m.item["path"].rstrip("/"))
+        label = "TBA files:" if args.tba and not folder else "Files:"  # a renamed folder's files aren't only TBA ones
+        limit = FOLDER_FILES if folder else FILES_ONLY
+        pairs = lambda files: [(o, n) for _, o, n in files]  # noqa: E731
+        loses = discord_escape("; ".join(m.irregular)) if folder and m.irregular else ""  # why it's irregular
+        if not held and (folder or m.files or took_unsure):
+            groups = [(label, pairs(m.files) + pairs(m.unsure if took_unsure and not args.force else ())),
+                      ("Forced:", pairs(m.unsure) if took_unsure and args.force else [])]
+            renames.append((title + note, discord_diff(old, m.expected if folder else old, groups,
+                                                       loses if args.force else "", limit)))
+        unsure = () if took_unsure else m.unsure
+        if held or unsure:
+            why = ", ".join((["IRREGULAR"] if held else []) + (["TBA?"] if unsure else []))
+            groups = [(label, pairs(m.files) if held else []), ("Interaction needed:", pairs(unsure))]
+            not_renamed.append((f"{title} - {why}", discord_diff(old, m.expected if held else old, groups, loses,
+                                                                 limit)))
+
+    def show(m: Mismatch) -> None:
+        item = m.item
+        ids = ", ".join(f"{k} {item_id(item, k)}" for k in ID_FIELDS if item_id(item, k))
+        print(f"    ARR    {item['title']!r} ({item.get('year') or 'no year'}), {ids or 'no ids'}")
+        if m.problems:
+            print(f"    -> {m.expected}")
+            print(f"    {'; '.join(m.problems)}")
+        if m.ignored:
+            what, options = zip(*(IGNORABLE[k] for k in m.ignored))
+            print(f"    IGNORED ({', '.join(options)}): only {' and '.join(what)} differ from {m.expected}")
+        if m.blocker:
+            print(f"    CAN'T RENAME: {m.blocker}")
+        elif m.irregular:
+            print(f"    IRREGULAR: {'; '.join(m.irregular)}")
+        if m.problems and not m.blocker and not m.files and not m.skipped:  # renamed, but none of its files need to be
+            print("    files: already named correctly")
+        for word, files in (("FILE", m.files), ("TBA?", m.unsure)):  # every file, however many, so the log has them all
+            for _, old, new in files:
+                print(f"    {word} {old}\n      -> {new}")
+        for _, old, new, why in m.skipped:
+            what, options = zip(*(IGNORABLE[k] for k in why))
+            print(f"    IGNORED FILE ({', '.join(options)}): only {' and '.join(what)} differ\n"
+                  f"      {old}\n      -> {new}")
+        if m.unsure:
+            print(f"    TBA?: {len(m.unsure)} may not be a TBA title being filled in, so they need -i")
+
+    def to_do(m: Mismatch) -> bool:
+        """Whether `m` needs anything done: its folder or files renamed. (It may only be listed, as
+        ignored or as a folder that can't be renamed.)"""
+        return bool(m.problems) and not m.blocker or bool(m.files or m.unsure)
+
+    renamed = declined = needs_i = not_reviewed = up_to_date = forced = 0
+    # Counts for the summary, of what was renamed (done) and what waits for --interactive (need):
+    # folders, the files in those folders, items with file renames, and files renamed
+    done, need = [0, 0, 0, 0], [0, 0, 0, 0]
+    stopped = rename_all = False
+    last_done = None  # when the previous rename and its checks finished (see THROTTLE)
+    for i, m in enumerate(mismatches, 1):
+        print(f"[{i}/{len(mismatches)}] FOLDER {m.item['path'].rstrip('/')}")
+        show(m)
+        folder = bool(m.problems) and not m.blocker  # True if the folder itself will be renamed
+        if not (folder or m.files or m.unsure):
+            continue
+        if not changing:
+            change(m, folder, held=folder and bool(m.irregular))
+            continue
+        if last_done is not None:  # give the arr THROTTLE seconds after the previous rename, before the refresh below
+            time.sleep(max(0.0, THROTTLE - (time.monotonic() - last_done)))
+            last_done = None
+        print("    refreshing the arr's metadata to check it still needs renaming")
+        try:
+            present, fresh = recheck(arr, kind, m, files_mode, taken, args.ignore_case, args.ignore_punctuation)
+        except Exception as e:  # any error, not just connection ones: stop the run, but still send the report
+            print(f"    FAILED: couldn't refresh it: {e if isinstance(e, OSError) else repr(e)}")
+            change(m, folder, " - FAILED")
+            stopped = True
+            not_reviewed = sum(map(to_do, mismatches[i:]))
+            print("Stopping, so nothing else is moved until you've looked at this.")
+            break
+        if not present:
+            print("    NOT ON DISK after the refresh: skipped")
+            not_on_disk.append(m.item)
+            continue
+        if fresh is None:
+            print("    UP TO DATE after the refresh: nothing to rename any more")
+            up_to_date += 1
+            continue
+        if fresh[1:-1] != m[1:-1]:  # compare the plans, not the file count: a newly added file isn't a change
+            print("    CHANGED after the refresh, now:")
+            show(fresh)
+        m = mismatches[i - 1] = fresh
+        item = m.item
+        folder = bool(m.problems) and not m.blocker
+        if not (folder or m.files or m.unsure):
+            continue
+        irregular_folder = folder and bool(m.irregular)
+        if irregular_folder and args.force:
+            print("    FORCED: renaming the irregular folder anyway (--force)")
+        elif irregular_folder and not args.interactive:
+            print("    NOT RENAMED: irregular; review it with --interactive")
+            needs_i += 1
+            need[0] += 1
+            need[1] += m.count
+            if m.files:
+                need[2] += 1
+                need[3] += len(m.files)
+            change(m, folder, held=True)  # listed, so the Discord ping shows what needs looking at
+            continue
+        took_unsure = False
+        if args.interactive:
+            choice = "y"
+            if (folder or m.files) and (irregular_folder or not rename_all):
+                if irregular_folder:
+                    choice = ask("This is irregular (check the arr's metadata). Rename anyway? [y]es / [N]o / [q]uit: ", "ynq")
+                else:
+                    choice = ask("Rename? [y]es / [N]o / [a]ll remaining / [q]uit: ")
+                    rename_all = choice == "a"
+                    if rename_all:
+                        choice = "y"  # "all" still asks about each item's TBA? files, below
+            if choice == "y" and m.unsure:  # TBA? files are always asked about, even after "all"
+                choice = ask(f"{len(m.unsure)} TBA? file(s) may not be a TBA title being filled in. "
+                             "Rename them too? [y]es / [N]o / [q]uit: ", "ynq")
+                took_unsure = choice == "y"
+                if choice == "n" and (folder or m.files):
+                    choice = "y"  # no to the TBA? files, but still rename the rest
+            if choice == "q":
+                not_reviewed = sum(map(to_do, mismatches[i - 1:]))  # this one too
+                break
+            if choice == "n":
+                declined += 1
+                continue
+        elif m.unsure and args.force:
+            print(f"    FORCED: renaming the {len(m.unsure)} TBA? file(s) anyway (--force)")
+            took_unsure = True
+        elif m.unsure:
+            print(f"    NOT RENAMED: {len(m.unsure)} TBA? file(s); review them with --interactive")
+            needs_i += 1
+            need[2] += 1
+            need[3] += len(m.unsure)
+            if not (folder or m.files):
+                change(m, folder)
+                continue
+        labels = []
+        time.sleep(SETTLE)  # give the arr a moment after the refresh
+        try:
+            ok = True
+            if folder:
+                ok, label = rename(arr, kind, m)
+                labels.append(label)
+                if ok:  # mark the new path as taken, so no later item can be renamed onto it
+                    taken.add(fold(posixpath.join(posixpath.dirname(item["path"].rstrip("/")), m.expected)))
+                    done[0] += 1
+                    done[1] += m.count
+            todo = m.files + (m.unsure if took_unsure else ())
+            if ok and todo:
+                # only the planned ones: the arr's preview also has those --tba or --ignore-... left out
+                ok, label, files_done = rename_files(arr, kind, item["id"], {f[0] for f in todo})
+                labels.append(label)
+                if ok:  # from here on, m lists the files actually renamed, which may be fewer than planned
+                    unsure_ids = {f[0] for f in m.unsure}
+                    m = m._replace(files=tuple(f for f in files_done if f[0] not in unsure_ids),
+                                   unsure=tuple(f for f in files_done if f[0] in unsure_ids) if took_unsure else m.unsure)
+                    took_unsure = took_unsure and bool(m.unsure)
+                    if files_done:
+                        done[2] += 1
+                        done[3] += len(files_done)
+        except Exception as e:  # any error stops the run, as above
+            print(f"    FAILED: {e if isinstance(e, OSError) else repr(e)}")
+            ok = False
+            labels.append("FAILED")
+        last_done = time.monotonic()
+        if args.force and (irregular_folder or took_unsure):
+            labels.insert(0, "FORCED")
+            forced += 1
+        # nothing was left to rename: its files were renamed some other way in the meantime
+        if ok and not (folder or m.files or took_unsure):
+            up_to_date += 1
+            change(m, folder)  # only adds its TBA? files, if any are left for --interactive
+            continue
+        label = ", ".join(dict.fromkeys(label for label in labels if label))
+        change(m, folder, f" - {label}" if label else "", took_unsure)
+        if not ok:
+            stopped = True
+            not_reviewed = sum(map(to_do, mismatches[i:]))
+            print("Stopping, so nothing else is moved until you've looked at this.")
+            break
+        renamed += 1
+
+    if not changing:  # dry run: count what --apply would rename, and what it would leave for --interactive
+        for m in mismatches:
+            folder = bool(m.problems) and not m.blocker
+            counts = need if folder and m.irregular else done  # an irregular folder's files wait with it
+            counts[0] += folder
+            counts[1] += m.count
+            if m.files:
+                counts[2] += 1
+                counts[3] += len(m.files)
+            if m.unsure:
+                need[2] += 1
+                need[3] += len(m.unsure)
+    summary = []
+    if changing:
+        if declined:
+            summary.append(f"{declined} declined")
+        if forced:
+            summary.append(f"{forced} forced")
+        if up_to_date:
+            summary.append(f"{up_to_date} up to date after refresh")
+        if not_reviewed:
+            summary.append(f"{not_reviewed} not reviewed")
+    summary.append(f"{sum(bool(m.blocker) for m in mismatches)} can't rename")
+    for label, skipped in (("NOT ON DISK (skipped)", not_on_disk), (f"IGNORED (tagged {tag_name!r})", ignored)):
+        if skipped:
+            print(f"{label}:" + "".join(f"\n    {i['title']} ({i.get('year') or 'no year'})  {i['path']}"
+                                        for i in skipped))
+    for k in ("punctuation", "capitals"):  # what --ignore-punctuation / --ignore-case left alone, in the same order
+        what, option = IGNORABLE[k]
+        folders = [m for m in mismatches if k in m.ignored]
+        if folders:
+            print(f"IGNORED ({option}: only {what} differ):" + "".join(
+                f"\n    {m.item['title']} ({m.item.get('year') or 'no year'})  {m.item['path']}\n      -> {m.expected}"
+                for m in folders))
+        files = [(m.item["path"].rstrip("/"), old, new) for m in mismatches for _, old, new, why in m.skipped if k in why]
+        if files:
+            print(f"IGNORED FILES ({option}: only {what} differ):" + "".join(
+                f"\n    {path}/{old}\n      -> {new}" for path, old, new in files))
+    if not_on_disk:
+        summary.append(f"{len(not_on_disk)} not on disk")
+    noun, nouns = ("Series", "Series") if args.app == "sonarr" else ("Movie", "Movies")
+    lines = [tally(noun, nouns, *done)]
+    if any(need):
+        lines += ["**Needs intervention not renamed**", tally(noun, nouns, *need)]
+    lines.append(", ".join(summary) + (", 1 failed" if stopped else ""))
+    why_ignored = {"Tagged": len(ignored), **{k.capitalize(): sum(k in m.ignored for m in mismatches)
+                                              for k in ("punctuation", "capitals")}}
+    if any(why_ignored.values()):
+        lines.append("Ignored: " + ", ".join(f"{n} {why}" for why, n in why_ignored.items() if n))
+    files_ignored = {k.capitalize(): sum(k in s[3] for m in mismatches for s in m.skipped)
+                     for k in ("punctuation", "capitals")}
+    if any(files_ignored.values()):
+        lines.append("Ignored files: " + ", ".join(f"{n} {why}" for why, n in files_ignored.items() if n))
+    summary = "\n".join(lines)
+    print("\n" + summary)
+    if not changing and (renames or not_renamed):
+        print("Dry run: nothing changed. Re-run with --apply (or --interactive).")
+    if args.discord_webhook:
+        color = RED if stopped else GREEN if renamed else BLUE
+        # renames that only an --interactive run will do: irregular folders and TBA? files
+        need_i = needs_i if changing else sum(bool(m.irregular and not m.blocker or m.unsure) for m in mismatches)
+        reasons = []  # reasons to ping you: renames waiting for --interactive, and renames --force did anyway
+        if need_i:
+            reasons.append(f"{need_i} rename{'s' if need_i > 1 else ''} need{'s' if need_i == 1 else ''} an --interactive run")
+        if forced:
+            reasons.append(f"{forced} rename{'s were' if forced > 1 else ' was'} forced")
+        ping = args.discord_user if reasons else ""
+        why = "; ".join(reasons)
+        # what's left for --interactive first, then what was renamed, each under a bold heading
+        # (a field with a blank name)
+        fields = []
+        for header, entries in ((f"Not renamed {nouns.lower()}", not_renamed),
+                                (f"Renamed {nouns.lower()}" if changing else f"{nouns} to rename", renames)):
+            if entries:
+                fields += [("\u200b", f"**{header}**")] + entries
+        try:
+            discord_send(args.discord_webhook, f"{app} Renaminatorr: {', '.join(modes)}", summary, fields, color,
+                         script_footer(__file__), ping, why)
+        except Exception as e:  # the renames have happened either way, so just warn
+            print(f"WARNING: couldn't post to Discord: {e if isinstance(e, OSError) else repr(e)}", file=sys.stderr)
+    return 1 if stopped else 0
+
+
+# ----- Settings from a .env file next to the script -----
+# Each line is KEY=value. Blank lines and lines starting with # are ignored, an `export ` prefix is allowed, and a value
+# may be wrapped in single or double quotes. Variables already set in the environment win over the file.
+
+ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def load_env(path: str = ENV_FILE) -> None:
+    """Set each KEY=value in `path` as an environment variable, unless it's already set. No file is fine."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return
+    for n, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = (part.strip() for part in line.partition("="))
+        if not (sep and key):
+            sys.exit(f"{path}:{n}: expected KEY=value")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+# ----- Log: a copy of everything the script prints, in logs/ next to the script, to check on runs later -----
+# Each run is added to the end of logs/<script name>.log, between a line saying when it started, with which arguments
+# and from which git branch and commit, and a line saying when and how it ended. Answers typed at its questions are
+# logged after them, and a crash's traceback is logged too. Once the log reaches 5 MB, a run starts a new one; the old
+# ones are kept as <script name>.log.1 (the newest) to .log.3, and older ones are deleted.
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG_MAX_SIZE = 5 * 1024 * 1024  # bytes; a bigger log is moved to .log.1 and a new one started
+LOG_KEEP = 3  # old logs kept: .log.1 to .log.3
+SECRET = ("key", "webhook")  # options whose values are left out of the log
+
+
+class Tee:
+    """Writes to `stream` and to `log`. It has no fileno(), so input() writes its prompt through it."""
+
+    def __init__(self, stream, log):
+        self.stream, self.log = stream, log
+
+    def write(self, s: str) -> int:
+        self.stream.write(s)
+        self.log.write(s)
+        return len(s)
+
+    def flush(self) -> None:
+        self.stream.flush()
+        self.log.flush()
+
+
+class Answers:
+    """Reads from `stream` and logs each line read, so input()'s answers end up after its prompts."""
+
+    def __init__(self, stream, log):
+        self.stream, self.log = stream, log
+
+    def readline(self, *args) -> str:
+        line = self.stream.readline(*args)
+        self.log.write(line)
+        return line
+
+
+def masked_command(argv) -> str:
+    """`argv` as a command line, with the values of options like --api-key replaced by ***."""
+    out, hide = [], False
+    for arg in argv:
+        name, eq, _ = arg.partition("=")
+        secret = arg.startswith("--") and any(s in name for s in SECRET)
+        out.append("***" if hide else f"{name}=***" if secret and eq else shlex.quote(arg))
+        hide = secret and not eq  # the value is the next argument
+    return " ".join(out)
+
+
+def rotate_log(path: str) -> None:
+    """Move `path` to `path`.1, .1 to .2 and so on up to .LOG_KEEP, and delete any older ones."""
+    prefix = os.path.basename(path) + "."
+    for name in os.listdir(os.path.dirname(path)):
+        n = name[len(prefix):]
+        if name.startswith(prefix) and n.isdigit() and int(n) >= LOG_KEEP:
+            os.remove(os.path.join(os.path.dirname(path), name))
+    for n in range(LOG_KEEP - 1, 0, -1):
+        if os.path.exists(f"{path}.{n}"):
+            os.replace(f"{path}.{n}", f"{path}.{n + 1}")
+    os.replace(path, path + ".1")
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+@contextlib.contextmanager
+def tee(script: str, argv=None):
+    """Log what's printed (and typed) inside the `with` to logs/<`script`'s name>.log."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, os.path.splitext(os.path.basename(script))[0] + ".log")
+    if os.path.exists(path) and os.path.getsize(path) >= LOG_MAX_SIZE:
+        rotate_log(path)
+    argv = sys.argv[1:] if argv is None else argv
+    start = time.monotonic()
+    with open(path, "a", encoding="utf-8", errors="backslashreplace") as log:
+        log.write(f"===== {now()} · {script_footer(script)} · {masked_command(argv)}\n")
+        log.flush()
+        streams = sys.stdout, sys.stderr, sys.stdin
+        sys.stdout, sys.stderr, sys.stdin = Tee(sys.stdout, log), Tee(sys.stderr, log), Answers(sys.stdin, log)
+        end = "exit 0"
+        try:
+            yield path
+        except SystemExit as e:
+            if isinstance(e.code, str):  # sys.exit("message"): Python prints it once we're done
+                log.write(e.code + "\n")
+            end = f"exit {e.code if isinstance(e.code, int) else 0 if e.code is None else 1}"
+            raise
+        except KeyboardInterrupt:
+            end = "interrupted"
+            raise
+        except BaseException:
+            log.write(traceback.format_exc())
+            end = "crashed"
+            raise
+        finally:
+            sys.stdout, sys.stderr, sys.stdin = streams
+            log.write(f"===== {now()} · {end} after {int(time.monotonic() - start)}s\n\n")
+
+
+# ----- Discord: post a report to a channel as embeds, through a plain webhook -----
+# (Server Settings > Integrations > Webhooks.) A report is a title, a description, a list of fields (each a name and a
+# value, such as a series title and a ```diff``` code block) and a footer naming the script and the git commit it ran
+# from. Fields are packed into as few embeds as fit Discord's limits, one embed per message, and mentions are switched
+# off so a name like "@everyone" can't ping anybody.
+
+EMBED_FIELDS = 25   # fields per embed
+EMBED_CHARS = 5800  # Discord allows 6000 characters per embed; this leaves some room
+POST_GAP = 1.0      # seconds between messages, to stay under the webhook rate limit
+USER_AGENT = "vibes-scripts/1.0"  # Discord refuses urllib's default
+
+BLUE, GREEN, RED = 0x3498DB, 0x2ECC71, 0xE74C3C
+
+
+def discord_escape(text: str) -> str:
+    """Text shown as-is in Discord markdown."""
+    text = re.sub(r"([\\*_~`|])", r"\\\1", text)
+    return "\\" + text if text[:1] in "#>-" and text else text
+
+
+def script_footer(script: str) -> str:
+    """`script`'s name and the git branch and commit it's running from, e.g. "x.py · dev@5dd3027"
+    ("-dirty" if it has local changes). Just the name when git can't tell."""
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=os.path.dirname(os.path.abspath(script)), capture_output=True,
+                              text=True, timeout=10, check=True).stdout.strip()
+    name = os.path.basename(script)
+    try:
+        return f"{name} · {git('rev-parse', '--abbrev-ref', 'HEAD')}@{git('describe', '--always', '--dirty')}"
+    except (OSError, subprocess.SubprocessError):
+        return name
+
+
+def discord_diff(old: str, new: str, groups=(), note: str = "", limit: int | None = None) -> str:
+    """A ```diff``` code block showing `old` replaced by `new` (left out if they're the same), then
+    for each (label, files) in `groups` that has files, the label and each (old, new) file, as many
+    as fit in a field's 1024 characters, and at most `limit` per label. A `note` (markdown) goes on
+    a line above the block."""
+    def line(s):  # a ``` inside the block would end it early; 400 keeps the folder lines under 1024
+        return s.replace("```", "`\u200b`\u200b`")[:400]
+    note = (note if len(note) <= 150 else note[:149] + "…") + "\n" if note else ""  # 150 still fits with the above
+    body = "" if old == new else f"- {line(old)}\n+ {line(new)}"
+    room = 1024 - len(note) - len("```diff\n\n```") - len("\n… and 9999 more files")
+    for label, files in groups:
+        if not files:
+            continue
+        body += ("\n" if body else "") + label
+        for n, (o, nw) in enumerate(files):
+            pair = f"\n- {line(o)}\n+ {line(nw)}"
+            if n == limit or len(body) + len(pair) > room:
+                body += f"\n… and {len(files) - n} more files"
+                break
+            body += pair
+    return f"{note}```diff\n{body}\n```"
+
+
+def discord_embeds(title: str, description: str, fields, color: int, footer: str = "") -> list[dict]:
+    """Embeds holding `fields` ((name, value) pairs), as few as fit, each with `footer`. Later ones
+    are titled "(continued)"."""
+    text = footer[:2048]  # counts towards each embed's characters
+    out = [{"title": title[:256], "description": description[:4096], "color": color, "fields": []}]
+    size = len(out[0]["title"]) + len(out[0]["description"])
+    for name, value in fields:
+        field = {"name": name[:256], "value": value[:1024], "inline": False}
+        n = len(field["name"]) + len(field["value"])
+        if len(out[-1]["fields"]) == EMBED_FIELDS or size + n > EMBED_CHARS - len(text):
+            out.append({"title": f"{title} (continued)"[:256], "color": color, "fields": []})
+            size = len(out[-1]["title"])
+        out[-1]["fields"].append(field)
+        size += n
+    if text:
+        for embed in out:
+            embed["footer"] = {"text": text}
+    return out
+
+
+def discord_post(url: str, payload: dict, ping: str = "") -> None:
+    """POST `payload` to the webhook. Only the user id `ping` (if any) may be pinged."""
+    body = json.dumps({**payload, "allowed_mentions": {"parse": [], "users": [ping] if ping else []}}).encode()
+    for _ in range(5):
+        req = urllib.request.Request(url, data=body, method="POST", headers={
+            "Content-Type": "application/json", "User-Agent": USER_AGENT})
+        try:
+            urllib.request.urlopen(req, timeout=30).close()
+            return
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                raise
+            try:
+                wait = float(json.loads(e.read()).get("retry_after", 1))
+            except (ValueError, TypeError, AttributeError):  # not Discord's JSON, e.g. a Cloudflare page
+                wait = 1
+            time.sleep(wait)
+    raise OSError("Discord kept rate-limiting the webhook")
+
+
+def discord_send(url: str, title: str, description: str, fields, color: int = BLUE, footer: str = "",
+                 ping: str = "", why: str = "") -> None:
+    """Post the report to the webhook at `url`, one embed per message. With `ping` (a Discord user
+    id), the first message also mentions that user, followed by `why`; embeds alone can't ping."""
+    for n, embed in enumerate(discord_embeds(title, description, fields, color, footer)):
+        payload = {"embeds": [embed]}
+        if n:
+            time.sleep(POST_GAP)
+        elif ping:
+            payload["content"] = f"<@{ping}> {why}".strip()
+        discord_post(url, payload, ping if not n else "")
+
+
+if __name__ == "__main__":
+    load_env()
+    sys.stdout.reconfigure(errors="backslashreplace")
+    with tee(__file__):
+        sys.exit(main())
