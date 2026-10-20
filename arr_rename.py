@@ -51,6 +51,14 @@ Options
   Series and movies with the tag given by --ignore-tag (or SONARR_IGNORE_TAG / RADARR_IGNORE_TAG)
   are left alone.
 
+Several Sonarrs or Radarrs
+  Besides the main one (SONARR_URL, SONARR_API_KEY, SONARR_IGNORE_TAG), you can set up named ones:
+  SONARR_ANIME_URL, SONARR_ANIME_API_KEY and SONARR_ANIME_IGNORE_TAG make one called "anime" (the
+  same for RADARR_..._URL). A run checks every one in turn, main first, then by name, each with its
+  own section in the log and its own Discord post; --instance anime (or main) checks just one.
+  Every one's URL and API key must be set before anything starts, and a problem in one stops the
+  whole run, so the rest aren't checked either.
+
 Log and Discord
   Everything the script prints, and your answers to its questions, also go into
   logs/arr_rename.log next to the script, with the time each run started and ended.
@@ -67,6 +75,9 @@ Settings
     RADARR_URL, RADARR_API_KEY    e.g. RADARR_URL=http://192.168.1.10:7878
     SONARR_IGNORE_TAG             optional: leave series with this tag alone (--ignore-tag)
     RADARR_IGNORE_TAG             optional: leave movies with this tag alone (--ignore-tag)
+    SONARR_<NAME>_URL, ..._API_KEY, ..._IGNORE_TAG
+                                  optional: another Sonarr, called NAME (the same for RADARR_<NAME>_...;
+                                  see "Several Sonarrs or Radarrs" above)
     DISCORD_WEBHOOK_URL           optional: post each run's results to this Discord webhook
                                   (Server Settings > Integrations > Webhooks)
     DISCORD_USER_ID               optional: your Discord user id, pinged when renames need an
@@ -603,8 +614,12 @@ def main(argv=None) -> int:
     for name in sorted(KINDS):
         things = "series" if name == "sonarr" else "movies"
         p, var = apps.add_parser(name, help=f"check the {things} in {name.capitalize()}"), name.upper()
-        p.add_argument("--url", help=f"{name.capitalize()} URL (default: ${var}_URL)")
-        p.add_argument("--api-key", help=f"its API key (default: ${var}_API_KEY)")
+        p.add_argument("--instance", metavar="NAME",
+                       help=f"only check this {name.capitalize()}: NAME from ${var}_<NAME>_URL, or main for ${var}_URL "
+                            f"(default: every one set up, in turn)")
+        p.add_argument("--url", help=f"{name.capitalize()} URL, for one instance (default: ${var}_URL, or "
+                                     f"${var}_<NAME>_URL with --instance)")
+        p.add_argument("--api-key", help=f"its API key (default: ${var}_API_KEY, or ${var}_<NAME>_API_KEY)")
         mode = p.add_mutually_exclusive_group()
         mode.add_argument("--apply", action="store_true",
                           help="do every rename, except irregular ones, which need -i (default is a dry run)")
@@ -625,7 +640,8 @@ def main(argv=None) -> int:
                             "id tags)")
         p.add_argument("--force", action="store_true",
                        help="with --apply, also do the renames that need -i (irregular folders, TBA? files)")
-        p.add_argument("--ignore-tag", metavar="TAG", help=f"leave {things} with this tag alone (default: ${var}_IGNORE_TAG)")
+        p.add_argument("--ignore-tag", metavar="TAG", help=f"leave {things} with this tag alone, in every instance "
+                                                            f"(default: ${var}_IGNORE_TAG, or ${var}_<NAME>_IGNORE_TAG)")
         p.add_argument("--discord-webhook", default=os.environ.get("DISCORD_WEBHOOK_URL"), metavar="URL",
                        help="post the results to this Discord webhook (default: $DISCORD_WEBHOOK_URL)")
         p.add_argument("--discord-user", default=os.environ.get("DISCORD_USER_ID"), metavar="ID",
@@ -635,38 +651,83 @@ def main(argv=None) -> int:
         ap.error("--force only works with --apply")
     if args.discord_user and not args.discord_user.isdigit():
         ap.error(f"the Discord user id must be a number (Copy User ID in Discord), not {args.discord_user!r}")
-    files_mode = "all" if args.files else "tba" if args.tba else None
-    prefix, arr_name = args.app.upper(), args.app.capitalize()
     modes = ["folders"] + (["files"] if args.files else []) + (["tba"] if args.tba else [])
     modes += ["ignore case"] if args.ignore_case else []
     modes += ["ignore punctuation"] if args.ignore_punctuation else []
     modes += ["force"] if args.force else []
     modes.append("apply" if args.apply else "interactive" if args.interactive else "dry run")
+    modes = ", ".join(modes)
 
-    def couldnt_start(reason: str):
-        """End a run that couldn't start: log the reason, post it to Discord with a ping (otherwise a
-        scheduled run nobody watches would fail unnoticed), and exit with code 1. Nothing has been
-        changed at this point."""
-        if args.discord_webhook:
-            try:
-                discord_send(args.discord_webhook, f"{arr_name} Renaminatorr: {', '.join(modes)}",
-                             f"**Couldn't start the run:** {discord_escape(reason)}", [], RED,
-                             script_footer(__file__), args.discord_user or "", "the run couldn't start")
-            except Exception as e:  # a Discord problem mustn't stop the reason being logged below
-                print(f"WARNING: couldn't post to Discord: {e if isinstance(e, OSError) else repr(e)}", file=sys.stderr)
-        sys.exit(f"Couldn't start the run: {reason}")
+    configured = instances(args.app)
+    if args.instance:
+        name = None if args.instance.lower() == "main" else args.instance.lower()
+        if not (args.url or name in configured):
+            ap.error(f"no {args.app.capitalize()} called {args.instance!r}: set {settings(args.app, name)[0]}_URL "
+                     f"(set up: {', '.join(n or 'main' for n in configured) or 'none'})")
+        names = [name]
+    elif args.url or args.api_key or not configured:
+        names = [None]  # --url / --api-key are for one instance: the main one, unless --instance says otherwise
+    else:
+        names = configured
+    for name in names:  # every one's URL and API key, before anything is changed in any of them
+        prefix, label = settings(args.app, name)
+        if not ((args.url or os.environ.get(f"{prefix}_URL")) and (args.api_key or os.environ.get(f"{prefix}_API_KEY"))):
+            couldnt_start(args, label, modes, f"no {label} URL or API key: set {prefix}_URL and {prefix}_API_KEY "
+                                              "(e.g. in .env), or pass --url and --api-key")
+    for n, name in enumerate(names):
+        if len(names) > 1:
+            print(("\n" if n else "") + f"----- {settings(args.app, name)[1]} -----")
+        code = run(args, name, modes)
+        if code and names[n + 1:]:
+            print(f"Stopping, so these aren't checked either: {', '.join(settings(args.app, m)[1] for m in names[n + 1:])}")
+        if code:
+            return code
+    return 0
 
+
+def instances(app: str) -> list:
+    """The `app` ("sonarr"/"radarr") instances set up in the environment: None for the main one
+    (SONARR_URL), then the named ones (SONARR_<NAME>_URL) by name, in lower case."""
+    pre = app.upper() + "_"
+    named = {k[len(pre):-len("_URL")].lower() for k, v in os.environ.items()
+             if k.startswith(pre) and k.endswith("_URL") and k[len(pre):-len("_URL")] and v}
+    return ([None] if os.environ.get(pre + "URL") else []) + sorted(named)
+
+
+def settings(app: str, name: str | None) -> tuple[str, str]:
+    """The start of an instance's setting names ("SONARR" or "SONARR_ANIME"), and how the log and
+    Discord name it ("Sonarr" or "Sonarr Anime")."""
+    return (app.upper() + (f"_{name.upper()}" if name else ""),
+            app.capitalize() + (f" {name.title()}" if name else ""))
+
+
+def couldnt_start(args, label: str, modes: str, reason: str):
+    """End a run that couldn't start: log the reason, post it to Discord with a ping (otherwise a
+    scheduled run nobody watches would fail unnoticed), and exit with code 1. Nothing has been
+    changed in this instance at this point, nor in any after it."""
+    if args.discord_webhook:
+        try:
+            discord_send(args.discord_webhook, f"{label} Renaminatorr: {modes}",
+                         f"**Couldn't start the run:** {discord_escape(reason)}", [], RED,
+                         script_footer(__file__), args.discord_user or "", "the run couldn't start")
+        except Exception as e:  # a Discord problem mustn't stop the reason being logged below
+            print(f"WARNING: couldn't post to Discord: {e if isinstance(e, OSError) else repr(e)}", file=sys.stderr)
+    sys.exit(f"Couldn't start the run: {reason}")
+
+
+def run(args, name: str | None, modes: str) -> int:
+    """Check, and with --apply or -i rename, one instance of the arr: the main one, or `name`.
+    Returns the exit code: 1 if a problem stopped it."""
+    files_mode = "all" if args.files else "tba" if args.tba else None
+    prefix, arr_name = settings(args.app, name)
+    suffix = f" {name.title()}" if name else ""  # after the app's own name, in the Discord title
     url = args.url or os.environ.get(f"{prefix}_URL")
     api_key = args.api_key or os.environ.get(f"{prefix}_API_KEY")
-    if not (url and api_key):
-        couldnt_start(f"no {arr_name} URL or API key: set {prefix}_URL and {prefix}_API_KEY (e.g. in .env), "
-                      "or pass --url and --api-key")
-
     arr = Arr(url, api_key)
     try:
         app = arr.get("/api/v3/system/status").get("appName", "")
         if app.lower() != args.app:
-            couldnt_start(f"{url} is {f'{app}, ' if app else ''}not {arr_name}")
+            couldnt_start(args, arr_name, modes, f"{url} is {f'{app}, ' if app else ''}not {arr_name}")
         kind = KINDS[args.app]
         print(f"Reading {kind.items} from {app}")
         tag_name = args.ignore_tag or os.environ.get(f"{prefix}_IGNORE_TAG")
@@ -674,8 +735,8 @@ def main(argv=None) -> int:
         if tag_name:
             tags = {t["label"].lower(): t["id"] for t in arr.get("/api/v3/tag")}
             if tag_name.lower() not in tags:
-                couldnt_start(f"{app} has no tag {tag_name!r}, so nothing would be ignored. "
-                              f"Its tags: {', '.join(sorted(tags)) or 'none'}")
+                couldnt_start(args, arr_name, modes, f"{app} has no tag {tag_name!r}, so nothing would be ignored. "
+                                                     f"Its tags: {', '.join(sorted(tags)) or 'none'}")
             ignore_tag = tags[tag_name.lower()]
             print(f"Ignoring {kind.items} tagged {tag_name!r}")
         mismatches, not_on_disk, ignored, taken = plan(arr, kind, files_mode, ignore_tag, args.ignore_case,
@@ -683,7 +744,7 @@ def main(argv=None) -> int:
     except Exception as e:  # e.g. the arr can't be reached, refuses the API key, or sends a reply we can't read
         if not isinstance(e, OSError):
             traceback.print_exc()  # not a connection problem, so maybe a bug: put the details in the log
-        couldnt_start(str(e) if isinstance(e, OSError) else repr(e))
+        couldnt_start(args, arr_name, modes, str(e) if isinstance(e, OSError) else repr(e))
 
     changing = args.apply or args.interactive
     # The Discord entries, as (title, diff): renames left for --interactive, and renames done (in a dry run, to do)
@@ -957,7 +1018,7 @@ def main(argv=None) -> int:
             if entries:
                 fields += [("\u200b", f"**{header}**")] + entries
         try:
-            discord_send(args.discord_webhook, f"{app} Renaminatorr: {', '.join(modes)}", summary, fields, color,
+            discord_send(args.discord_webhook, f"{app}{suffix} Renaminatorr: {modes}", summary, fields, color,
                          script_footer(__file__), ping, why)
         except Exception as e:  # the renames have happened either way, so just warn
             print(f"WARNING: couldn't post to Discord: {e if isinstance(e, OSError) else repr(e)}", file=sys.stderr)

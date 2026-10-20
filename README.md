@@ -1,6 +1,6 @@
 # Scripts
 Just random scripts to share
-# arr_rename.py
+# arr_rename.py - All vibes don't blame me
 
 Renames Sonarr series and Radarr movie folders (and their files) that don't match the arr's naming format, through the arr itself, then checks no files went missing. Any problem stops the run.
 
@@ -9,6 +9,10 @@ Python 3.9+ (standard library only) and the rest of this repo (`lib/`).
 ## Setup
 
 Copy `.env.example` to `.env` and fill in `SONARR_URL` / `SONARR_API_KEY` and/or `RADARR_URL` / `RADARR_API_KEY`.
+
+## Several Sonarrs or Radarrs
+
+Add named sets to `.env`, such as `SONARR_ANIME_URL` / `SONARR_ANIME_API_KEY` / `SONARR_ANIME_IGNORE_TAG` or `RADARR_4K_URL` / `RADARR_4K_API_KEY`. A run checks the main one, then each named one, with its own log section and Discord post. A problem in one stops the run.
 
 ## Usage
 ```bash
@@ -24,6 +28,7 @@ Renames that would lose information (a year, an id tag, the title) are marked **
 | Option | Description |
 | --- | --- |
 | `sonarr` / `radarr` | Which arr to check (required, first) |
+| `--instance NAME` | Only check this one when several are set up (`main` for the plain `SONARR_URL` one); default is every one, in turn |
 | `--url URL` | Arr address (default: `SONARR_URL` / `RADARR_URL`) |
 | `--api-key KEY` | Arr API key (default: `SONARR_API_KEY` / `RADARR_API_KEY`) |
 | `--apply` | Do every rename except irregular ones (default is a dry run) |
