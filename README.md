@@ -14,7 +14,7 @@ Copy `.env.example` to `.env` and fill in `SONARR_URL` / `SONARR_API_KEY` and/or
 
 ## Several Sonarrs or Radarrs
 
-Add named sets to `.env`, such as `SONARR_ANIME_URL` / `SONARR_ANIME_API_KEY` / `SONARR_ANIME_IGNORE_TAG` or `RADARR_4K_URL` / `RADARR_4K_API_KEY`. A run checks the main one, then each named one, with its own log section and Discord post. A problem in one stops the run.
+Add named sets to `.env`, such as `SONARR_ANIME_URL` / `SONARR_ANIME_API_KEY` / `SONARR_ANIME_IGNORE_TAG` or `RADARR_4K_URL` / `RADARR_4K_API_KEY`. A run checks the main one, then each named one, with its own log section and Discord post. One that can't start (it can't be reached, say) is reported and skipped, and the others are still checked; a problem once renaming has started stops the run.
 
 ## Usage
 ```bash
@@ -45,6 +45,6 @@ Renames that would lose information (a year, an id tag, the title) are marked **
 | `--ignore-punctuation` | Skip folders and files that only differ in special characters |
 | `--ignore-tag TAG` | Leave items with this tag alone (default: `SONARR_IGNORE_TAG` / `RADARR_IGNORE_TAG`) |
 | `--discord-webhook URL` | Post each run's report to Discord (default: `DISCORD_WEBHOOK_URL`) |
-| `--discord-user ID` | Discord user id to ping when something needs `-i` or was forced (default: `DISCORD_USER_ID`) |
+| `--discord-user ID` | Discord user id to ping when a run can't start or stops, or something needs `-i` or was forced (default: `DISCORD_USER_ID`) |
 
 `--apply` and `-i` can't be combined, and neither can `--files` and `--tba`.

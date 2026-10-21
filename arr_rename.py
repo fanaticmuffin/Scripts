@@ -62,17 +62,18 @@ Several Sonarrs or Radarrs
   SONARR_ANIME_URL, SONARR_ANIME_API_KEY and SONARR_ANIME_IGNORE_TAG make one called "anime" (the
   same for RADARR_..._URL). A run checks every one in turn, main first, then by name, each with its
   own section in the log and its own Discord post; --instance anime (or main) checks just one.
-  Every one's URL and API key must be set before anything starts, and a problem in one stops the
-  whole run, so the rest aren't checked either.
+  One that can't start (see below) is skipped, and the others are still checked. A problem once
+  renaming has started stops the whole run, so the rest aren't checked either.
 
 Log and Discord
   Everything the script prints, and your answers to its questions, also go into
   logs/arr_rename.log next to the script, with the time each run started and ended.
   If a Discord webhook is set (DISCORD_WEBHOOK_URL or --discord-webhook), each run posts a report:
   whether it was a dry run, and one entry per rename (done, or still to do) showing the old and
-  new folder name and the file names under it. If the run can't start (the arr can't be reached,
-  it refuses the API key, the --ignore-tag doesn't exist, ...), the reason goes in the log and in
-  a red Discord post, before anything is changed.
+  new folder name and the file names under it. If the run can't start in a Sonarr or Radarr (it
+  can't be reached, it refuses the API key, its URL or API key isn't set, the --ignore-tag doesn't
+  exist, ...), the reason goes in the log and in a red Discord post, before anything is changed in
+  it, and the run's exit code is 1.
 
 Settings
   Each one is read from the environment, or else from a .env file next to the script, with one
@@ -86,8 +87,8 @@ Settings
                                   see "Several Sonarrs or Radarrs" above)
     DISCORD_WEBHOOK_URL           optional: post each run's results to this Discord webhook
                                   (Server Settings > Integrations > Webhooks)
-    DISCORD_USER_ID               optional: your Discord user id, pinged when renames need an
-                                  --interactive run or were forced, or a run can't start. Turn on
+    DISCORD_USER_ID               optional: your Discord user id, pinged when a run can't start or
+                                  stops, or renames need an --interactive run or were forced. Turn on
                                   Developer Mode (Settings > Advanced), then right-click your name >
                                   Copy User ID.
 
@@ -668,7 +669,8 @@ def main(argv=None) -> int:
         p.add_argument("--discord-webhook", default=os.environ.get("DISCORD_WEBHOOK_URL"), metavar="URL",
                        help="post the results to this Discord webhook (default: $DISCORD_WEBHOOK_URL)")
         p.add_argument("--discord-user", default=os.environ.get("DISCORD_USER_ID"), metavar="ID",
-                       help="Discord user id to ping when renames need an --interactive run (default: $DISCORD_USER_ID)")
+                       help="Discord user id to ping when a run can't start or stops, or renames need an --interactive run "
+                            "or were forced (default: $DISCORD_USER_ID)")
     args = ap.parse_args(argv)
     if args.force and not args.apply:
         ap.error("--force only works with --apply")
@@ -692,20 +694,24 @@ def main(argv=None) -> int:
         names = [None]  # --url / --api-key are for one instance: the main one, unless --instance says otherwise
     else:
         names = configured
-    for name in names:  # every one's URL and API key, before anything is changed in any of them
-        prefix, label = settings(args.app, name)
-        if not ((args.url or os.environ.get(f"{prefix}_URL")) and (args.api_key or os.environ.get(f"{prefix}_API_KEY"))):
-            couldnt_start(args, label, modes, f"no {label} URL or API key: set {prefix}_URL and {prefix}_API_KEY "
-                                              "(e.g. in .env), or pass --url and --api-key")
+    code, failed = 0, []  # failed: the ones that couldn't start
     for n, name in enumerate(names):
+        label = settings(args.app, name)[1]
         if len(names) > 1:
-            print(("\n" if n else "") + f"----- {settings(args.app, name)[1]} -----")
-        code = run(args, name, modes)
-        if code and names[n + 1:]:
-            print(f"Stopping, so these aren't checked either: {', '.join(settings(args.app, m)[1] for m in names[n + 1:])}")
+            print(("\n" if n else "") + f"----- {label} -----")
+        try:
+            code = run(args, name, modes)
+        except CouldntStart as e:  # nothing was changed in it, so the others can still be checked
+            couldnt_start(args, label, modes, str(e))
+            failed.append(label)
+            continue
         if code:
-            return code
-    return 0
+            if names[n + 1:]:
+                print(f"Stopping, so these aren't checked either: {', '.join(settings(args.app, m)[1] for m in names[n + 1:])}")
+            break
+    if failed and len(names) > 1:  # (with just one, why is just above)
+        print(f"\nCouldn't start: {', '.join(failed)} (see above)")
+    return 1 if code or failed else 0
 
 
 def instances(app: str) -> list:
@@ -724,33 +730,39 @@ def settings(app: str, name: str | None) -> tuple[str, str]:
             app.capitalize() + (f" {name.title()}" if name else ""))
 
 
-def couldnt_start(args, label: str, modes: str, reason: str):
-    """End a run that couldn't start: log the reason, post it to Discord with a ping (otherwise a
-    scheduled run nobody watches would fail unnoticed), and exit with code 1. Nothing has been
-    changed in this instance at this point, nor in any after it."""
+class CouldntStart(Exception):
+    """Why the run can't start in a Sonarr or Radarr. It's found out before anything is changed in it."""
+
+
+def couldnt_start(args, label: str, modes: str, reason: str) -> None:
+    """Report that the run couldn't start in the Sonarr or Radarr `label`: log the reason, and post
+    it to Discord with a ping (otherwise a scheduled run nobody watches would fail unnoticed)."""
+    print(f"Couldn't start the run: {reason}", file=sys.stderr)
     if args.discord_webhook:
         try:
             discord_send(args.discord_webhook, f"{label} Renaminatorr: {modes}",
                          f"**Couldn't start the run:** {discord_escape(reason)}", [], RED,
                          script_footer(__file__), args.discord_user or "", "the run couldn't start")
-        except Exception as e:  # a Discord problem mustn't stop the reason being logged below
+        except Exception as e:  # a Discord problem mustn't stop the run going on to the next one
             print(f"WARNING: couldn't post to Discord: {e if isinstance(e, OSError) else repr(e)}", file=sys.stderr)
-    sys.exit(f"Couldn't start the run: {reason}")
 
 
 def run(args, name: str | None, modes: str) -> int:
     """Check, and with --apply or -i rename, one instance of the arr: the main one, or `name`.
-    Returns the exit code: 1 if a problem stopped it."""
+    Returns the exit code: 1 if a problem stopped it. Raises CouldntStart if the run can't start."""
     files_mode = "all" if args.files else "tba" if args.tba else None
     prefix, arr_name = settings(args.app, name)
     suffix = f" {name.title()}" if name else ""  # after the app's own name, in the Discord title
     url = args.url or os.environ.get(f"{prefix}_URL")
     api_key = args.api_key or os.environ.get(f"{prefix}_API_KEY")
+    if not (url and api_key):
+        raise CouldntStart(f"no {arr_name} URL or API key: set {prefix}_URL and {prefix}_API_KEY (e.g. in .env), "
+                           "or pass --url and --api-key")
     arr = Arr(url, api_key)
     try:
         app = arr.get("/api/v3/system/status").get("appName", "")
         if app.lower() != args.app:
-            couldnt_start(args, arr_name, modes, f"{url} is {f'{app}, ' if app else ''}not {arr_name}")
+            raise CouldntStart(f"{url} is {f'{app}, ' if app else ''}not {arr_name}")
         kind = KINDS[args.app]
         print(f"Reading {kind.items} from {app}")
         tag_name = args.ignore_tag or os.environ.get(f"{prefix}_IGNORE_TAG")
@@ -758,16 +770,18 @@ def run(args, name: str | None, modes: str) -> int:
         if tag_name:
             tags = {t["label"].lower(): t["id"] for t in arr.get("/api/v3/tag")}
             if tag_name.lower() not in tags:
-                couldnt_start(args, arr_name, modes, f"{app} has no tag {tag_name!r}, so nothing would be ignored. "
-                                                     f"Its tags: {', '.join(sorted(tags)) or 'none'}")
+                raise CouldntStart(f"{app} has no tag {tag_name!r}, so nothing would be ignored. "
+                                   f"Its tags: {', '.join(sorted(tags)) or 'none'}")
             ignore_tag = tags[tag_name.lower()]
             print(f"Ignoring {kind.items} tagged {tag_name!r}")
         mismatches, not_on_disk, ignored, taken = plan(arr, kind, files_mode, ignore_tag, args.ignore_case,
                                                        args.ignore_punctuation)
+    except CouldntStart:
+        raise
     except Exception as e:  # e.g. the arr can't be reached, refuses the API key, or sends a reply we can't read
         if not isinstance(e, OSError):
             traceback.print_exc()  # not a connection problem, so maybe a bug: put the details in the log
-        couldnt_start(args, arr_name, modes, str(e) if isinstance(e, OSError) else repr(e))
+        raise CouldntStart(str(e) if isinstance(e, OSError) else repr(e)) from e
 
     changing = args.apply or args.interactive
     # The Discord entries, as (title, diff): renames left for --interactive, and renames done (in a dry run, to do)
@@ -1026,7 +1040,9 @@ def run(args, name: str | None, modes: str) -> int:
         color = RED if stopped else GREEN if renamed else BLUE
         # renames that only an --interactive run will do: irregular folders and TBA? files
         need_i = needs_i if changing else sum(bool(m.irregular and not m.blocker or m.unsure) for m in mismatches)
-        reasons = []  # reasons to ping you: renames waiting for --interactive, and renames --force did anyway
+        # reasons to ping you: a problem that stopped the run, renames waiting for --interactive, and renames
+        # --force did anyway
+        reasons = ["the run stopped"] if stopped else []
         if need_i:
             reasons.append(f"{need_i} rename{'s' if need_i > 1 else ''} need{'s' if need_i == 1 else ''} an --interactive run")
         if forced:
@@ -1289,6 +1305,7 @@ def discord_send(url: str, title: str, description: str, fields, color: int = BL
 
 if __name__ == "__main__":
     load_env()
-    sys.stdout.reconfigure(errors="backslashreplace")
+    # line by line even into a pipe (cron, docker logs), so it stays in order with what goes to stderr
+    sys.stdout.reconfigure(errors="backslashreplace", line_buffering=True)
     with tee(__file__):
         sys.exit(main())
