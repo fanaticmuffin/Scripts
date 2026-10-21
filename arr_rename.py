@@ -35,9 +35,10 @@ File names
   same way.
   --files checks the files of every item, so files are renamed even when their folder is fine.
   --tba (Sonarr only) does the same, but only for files whose episode title was "TBA" and now has
-  a real title, and only when that's the only change. Less clear cases, such as a new title with
-  TBA in it ("This episode title is TBA", "FOOTBALL"), are marked TBA? and, like irregular
-  folders, only renamed with --interactive.
+  a real title, and only when that's the only change. TBA only counts as a word of its own, with a
+  space before it and a space or the file extension after it, so "FOOTBALL" has none. Less clear
+  cases, such as a new title with TBA in it ("This episode title is TBA"), are marked TBA? and,
+  like irregular folders, only renamed with --interactive.
 
 Irregular renames
   If the new name would lose something the current folder name has (its year, an id tag or the
@@ -127,6 +128,8 @@ YEAR = re.compile(r"\((\d{4})\)")
 SPECIAL = re.compile(rf"({ID_TAG.pattern}|{YEAR.pattern})|[^\w\s]|_", re.IGNORECASE)
 # A "(1)" or "Part 1" ending, which Sonarr leaves out when it puts several episode titles in one file name
 MULTI_PART = re.compile(r":?\s?(?:\(\d+\)|(?:Part|Pt\.?)\s?\d+)$", re.IGNORECASE)
+# "TBA" as a word of its own: a space before it, and a space or the file extension after it
+TBA = re.compile(r"(?<= )TBA(?= |\.\w+$|$)")
 
 
 class Kind(NamedTuple):
@@ -322,22 +325,23 @@ def just_titles(text: str, titles) -> bool:
 
 def tba_kind(old: str, new: str, titles) -> str | None:
     """What kind of change renaming the file `old` to `new` is. `titles` are the file's episode titles.
+    Only a "TBA" that's a word of its own counts (see TBA): "FOOTBALL" and "TBAx" have none.
 
     "tba"     It only fills in an episode title that used to be "TBA". Either putting "TBA" back in
               place of the titles in `new` gives exactly `old`, or the only change is the word
               "TBA" being replaced by the titles (perhaps tidied up, see just_titles). Also, none
               of the new titles may contain "TBA".
     "unsure"  It looks TBA-related but isn't clear-cut: a new title contains "TBA" (like "This
-              episode title is TBA", or a word like "FOOTBALL"), a "TBA" disappears some other way
+              episode title is TBA"), a "TBA" disappears some other way
               ("Mask. TBA Again" -> "Mask. Again"), more than the title changes ("TBA" -> "Pilot
               [WEBDL-1080p]"; naming format changes are for --files), or there are no titles to
               check against.
-    None      It has nothing to do with TBA, or only capitals and punctuation change ("TBA" ->
-              "Tba", "episode title" -> "Episode Title!")."""
+    None      It has nothing to do with TBA (`old` has no "TBA"), or only capitals and punctuation
+              change ("TBA" -> "Tba", "episode title" -> "Episode Title!")."""
     old, new = posixpath.basename(old), posixpath.basename(new)
-    if letters(old) == letters(new):
+    if letters(old) == letters(new) or not TBA.search(old):
         return None
-    if any("TBA" in t and t not in old for t in titles):
+    if any(TBA.search(f" {t}") and t not in old for t in titles):  # " ": the title follows one in the file name
         return "unsure"
     known = sorted({t for t in titles if t and t != "TBA"}, key=len, reverse=True)
     # every title back to "TBA" in one go, longest first, so a short title can't match inside a longer one
@@ -345,9 +349,9 @@ def tba_kind(old: str, new: str, titles) -> str | None:
     if back == old and back != new:
         return "tba"
     was, now = only_change(old, new)
-    if was == "TBA" and "TBA" not in now and just_titles(now, titles):
+    if was == "TBA" and not TBA.search(f" {now} ") and just_titles(now, titles):
         return "tba"
-    return "unsure" if old.count("TBA") > new.count("TBA") else None
+    return "unsure" if len(TBA.findall(old)) > len(TBA.findall(new)) else None
 
 
 def tba_split(arr: Arr, series_id: int, renames) -> tuple[tuple, tuple]:
