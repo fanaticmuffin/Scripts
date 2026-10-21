@@ -17,9 +17,10 @@ How a folder is renamed (only with --apply or --interactive)
      stops the run.
   2. The item is checked again. If it no longer needs renaming, it's skipped. If the new name has
      changed, the new one is used.
-  3. Half a second later, the folder is renamed the same way the arr's web page does it: the
-     item's root folder is "changed" to the one it's already in, with "move files" on, so the arr
-     moves the folder to <root folder>/<correct name>.
+  3. Half a second later, once any refresh the arr is running has finished (one running during
+     the move could put the old folder back), the folder is renamed the same way the arr's web
+     page does it: the item's root folder is "changed" to the one it's already in, with "move
+     files" on, so the arr moves the folder to <root folder>/<correct name>.
   4. The script waits for the move to finish, then compares the files before and after, both on
      disk (as the arr sees them) and in the arr's records. If the records don't match the files,
      it asks the arr to refresh, and logs that.
@@ -500,6 +501,9 @@ def rename(arr: Arr, kind: Kind, m: Mismatch) -> tuple[bool, str]:
     item_id = m.item["id"]
     old = m.item["path"].rstrip("/")
     parent = posixpath.dirname(old)
+    # A refresh running during the move (like the arr's scheduled one) can save the old path back,
+    # and one still running would change the arr's records after they're read below
+    wait_for(arr, kind.refresh)
     db_before = tracked(arr, kind, item_id)
     disk_before = on_disk(arr, old)
     missing_before = set(db_before.values()) - disk_before
