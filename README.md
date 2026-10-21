@@ -4,7 +4,7 @@ Just random scripts to share
 
 Renames Sonarr series and Radarr movie folders (and their files) that don't match the arr's naming format, through the arr itself, then checks no files went missing. Any problem stops the run.
 
-Python 3.9+ (standard library only) and the rest of this repo (`lib/`).
+Python 3.9+ (standard library only).
 
 The arr must run on Linux or macOS (or in Docker). An arr running on Windows isn't supported: the script reads the arr's paths as Linux paths.
 
@@ -18,9 +18,12 @@ Add named sets to `.env`, such as `SONARR_ANIME_URL` / `SONARR_ANIME_API_KEY` / 
 
 ## Usage
 ```bash
-./arr_rename.py sonarr            # dry run: shows what it would rename
+./arr_rename.py sonarr            # dry run: shows what it would rename root folders only
+./arr_rename.py sonarr --files    # dry run: folders and files
+./arr_rename.py sonarr --tba      # dry run: folders and TBA episodes only
+./arr_rename.py radarr --files    # dry run: folders and files
 ./arr_rename.py sonarr -i         # asks about each rename
-./arr_rename.py radarr --apply    # renames everything it safely can
+./arr_rename.py radarr --apply    # root folders it can safely rename
 ```
 
 Renames that would lose information (a year, an id tag, the title) are marked **IRREGULAR** and only done with `-i` or `--force`. Everything printed is also saved to `logs/arr_rename.log`.
