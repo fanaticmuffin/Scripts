@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Find Sonarr series and Radarr movie folders whose names don't match the arr's naming format, and rename them.
 
-"The arr" below means Sonarr or Radarr, whichever one the script is pointed at.
+"The arr" below means Sonarr or Radarr, whichever one the script is pointed at. It must run on
+Linux or macOS (or in Docker): the script reads the arr's paths as Linux paths, so an arr running
+on Windows isn't supported.
 
 What is checked
   For each series or movie, the script asks the arr what its folder should be called (the arr's
@@ -26,7 +28,9 @@ How a folder is renamed (only with --apply or --interactive)
      it asks the arr to refresh, and logs that.
   5. It waits 2 seconds before contacting the arr again.
   Any problem stops the whole run, including an arr command still running after an hour, so
-  nothing else gets moved until you've looked at it.
+  nothing else gets moved until you've looked at it. Only a read from the arr that fails because
+  it can't be reached or has a server error (as while it restarts for an update) is tried once
+  more, 10 seconds later; a request that changes something never is.
 
 File names
   When a folder is renamed, its files are renamed too, to the names the arr's rename preview gives
@@ -114,6 +118,7 @@ THROTTLE = 2.0  # seconds to wait after a rename (and its checks) before contact
 SETTLE = 0.5    # seconds to wait between refreshing an item and renaming it
 POLL = 1.0      # seconds between checks on whether an arr command has finished
 TIMEOUT = 3600  # seconds to wait for an arr command before giving up; giving up stops the run
+RETRY = 10      # seconds to wait before trying a failed read from the arr again (once)
 BUSY = ("queued", "started")
 FOLDER_FILES = 2  # Discord: files listed under a renamed folder before "… and N more files"
 FILES_ONLY = 13   # Discord: files listed (per list) when only an item's files are renamed (--files or --tba)
@@ -184,7 +189,17 @@ class Arr:
         return json.loads(raw) if raw else None
 
     def get(self, endpoint: str, **params):
-        return self.call("GET", endpoint, params=params)
+        """Read from the arr. If it can't be reached or has a server error (as while it restarts),
+        try once more RETRY seconds later. Only reads are tried again: a request that changes
+        something may have gone through even though it failed."""
+        try:
+            return self.call("GET", endpoint, params=params)
+        except OSError as e:
+            if isinstance(e.__cause__, urllib.error.HTTPError) and e.__cause__.code < 500:
+                raise  # the arr refused it (wrong API key, not found, ...): trying again won't help
+            print(f"    {e}; trying once more in {RETRY}s")
+            time.sleep(RETRY)
+            return self.call("GET", endpoint, params=params)
 
 
 def fold(s: str) -> str:

@@ -6,6 +6,8 @@ Renames Sonarr series and Radarr movie folders (and their files) that don't matc
 
 Python 3.9+ (standard library only) and the rest of this repo (`lib/`).
 
+The arr must run on Linux or macOS (or in Docker). An arr running on Windows isn't supported: the script reads the arr's paths as Linux paths.
+
 ## Setup
 
 Copy `.env.example` to `.env` and fill in `SONARR_URL` / `SONARR_API_KEY` and/or `RADARR_URL` / `RADARR_API_KEY`.
