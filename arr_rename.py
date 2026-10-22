@@ -13,6 +13,8 @@ What is checked
   says what is different: the title, the year, an id tag ({tvdb-...}, {tmdb-...}, {imdb-...} or
   {tvmaze-...}) that doesn't match the arr's id, or only the capitals. The two options apply to
   file names in the same way: a file rename that only changes what they ignore is skipped.
+  These checks only read from the arr, 4 at a time (a few times faster with an arr behind a
+  reverse proxy or on another machine); the renames below are done one at a time.
 
 How a folder is renamed (only with --apply or --interactive)
   1. The item is refreshed in the arr, and the script waits for that to finish. A failed refresh
@@ -115,6 +117,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 THROTTLE = 2.0  # seconds to wait after a rename (and its checks) before contacting the arr again
@@ -122,6 +125,7 @@ SETTLE = 0.5    # seconds to wait between refreshing an item and renaming it
 POLL = 1.0      # seconds between checks on whether an arr command has finished
 TIMEOUT = 3600  # seconds to wait for an arr command before giving up; giving up stops the run
 RETRY = 10      # seconds to wait before trying a failed read from the arr again (once)
+THREADS = 4     # reads at a time while checking: as fast as 10 against a nearby arr, with less load on it
 BUSY = ("queued", "started")
 FOLDER_FILES = 2  # Discord: files listed under a renamed folder before "… and N more files"
 FILES_ONLY = 13   # Discord: files listed (per list) when only an item's files are renamed (--files or --tba)
@@ -450,27 +454,28 @@ def plan(arr: Arr, kind: Kind, files: str | None = None, ignore_tag: int | None 
          ignore_punctuation: bool = False):
     """Check every item in the arr. Returns four things: what needs renaming (a list of Mismatch),
     the items whose folder isn't on disk, the items skipped because they have the tag `ignore_tag`
-    (a tag id), and the paths of every item in lower case."""
+    (a tag id), and the paths of every item in lower case. The arr is read THREADS requests at a
+    time; nothing is changed here, and everything comes back in the items' order."""
     items = sorted(arr.get(f"/api/v3/{kind.items}"), key=lambda i: fold(i.get("sortTitle") or i["title"]))
     windows = next((i["path"] for i in items if "\\" in i["path"] or re.match(r"[A-Za-z]:", i["path"])), None)
     if windows:  # every folder would look missing, as its path isn't split up right
         raise CouldntStart(f"the arr uses Windows paths (like {windows!r}), which aren't supported")
     taken = {fold(i["path"].rstrip("/")) for i in items}
-    listings: dict[str, set] = {}
-    mismatches, not_on_disk, ignored = [], [], []
+    ignored, todo = [], []  # todo: (item, its parent folder, its folder name)
     for item in items:
         if ignore_tag is not None and ignore_tag in item.get("tags", []):
             ignored.append(item)
-            continue
-        parent, folder = posixpath.split(item["path"].rstrip("/"))
-        if parent not in listings:
-            listings[parent] = listing(arr, parent)
-        if folder not in listings[parent]:  # exact match: a folder with other capitals isn't the arr's
-            not_on_disk.append(item)
-            continue
-        m = check(arr, kind, item, files, taken, listings[parent], ignore_case, ignore_punctuation)
-        if m:
-            mismatches.append(m)
+        else:
+            todo.append((item, *posixpath.split(item["path"].rstrip("/"))))
+    with ThreadPoolExecutor(THREADS) as pool:
+        parents = list(dict.fromkeys(parent for _, parent, _ in todo))
+        listings = dict(zip(parents, pool.map(lambda parent: listing(arr, parent), parents)))
+        # exact match: a folder with other capitals isn't the arr's
+        not_on_disk = [item for item, parent, folder in todo if folder not in listings[parent]]
+        present = [(item, parent) for item, parent, folder in todo if folder in listings[parent]]
+        checked = pool.map(lambda t: check(arr, kind, t[0], files, taken, listings[t[1]], ignore_case,
+                                           ignore_punctuation), present)
+        mismatches = [m for m in checked if m]
     return mismatches, not_on_disk, ignored, taken
 
 
