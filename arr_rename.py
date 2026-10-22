@@ -25,7 +25,10 @@ How a folder is renamed (only with --apply or --interactive)
   3. Half a second later, once any refresh the arr is running has finished (one running during
      the move could put the old folder back), the folder is renamed the same way the arr's web
      page does it: the item's root folder is "changed" to the one it's already in, with "move
-     files" on, so the arr moves the folder to <root folder>/<correct name>.
+     files" on, so the arr moves the folder to <root folder>/<correct name>. A folder inside a
+     subfolder of a root folder can't be renamed this way (the arr only takes a root folder, and
+     would move it out of the subfolder), so it's listed as CAN'T RENAME; --files still renames
+     its files.
   4. The script waits for the move to finish, then compares the files before and after, both on
      disk (as the arr sees them) and in the arr's records. If the records don't match the files,
      it asks the arr to refresh, and logs that.
@@ -409,11 +412,12 @@ def tba_split(arr: Arr, series_id: int, renames) -> tuple[tuple, tuple]:
 
 
 def check(arr: Arr, kind: Kind, item: dict, files: str | None, taken: set, names: set,
-          ignore_case: bool = False, ignore_punctuation: bool = False) -> Mismatch | None:
+          ignore_case: bool = False, ignore_punctuation: bool = False, roots: set | None = None) -> Mismatch | None:
     """What needs renaming for `item`: its folder, its files, or both. None if nothing does.
 
     `taken` holds the paths (in lower case) of every item in the arr, and `names` the folders next
-    to this one, so a new name can't clash with them. When the folder is renamed, every file in it
+    to this one, so a new name can't clash with them. `roots` are the arr's root folders: a folder
+    not directly inside one can't be renamed in place (see rename). When the folder is renamed, every file in it
     that needs a new name is renamed too. When it isn't, `files` decides which files are checked:
     "all" checks every file, "tba" only those whose episode title was TBA and now has a real one
     (see tba_kind), and None none.
@@ -430,6 +434,8 @@ def check(arr: Arr, kind: Kind, item: dict, files: str | None, taken: set, names
         ignored = passed_over(folder, expected)
     elif not expected.strip() or "/" in expected:
         blocker = f"the arr gives an unusable folder name ({expected!r})"
+    elif roots and parent not in roots:  # the arr's editor refuses anything but a root folder
+        blocker = f"it's inside {parent}, not directly in a root folder, and the arr can only rename it by moving it out"
     # (a rename that only changes capitals keeps the item's own path, which isn't a clash)
     elif fold(expected) != fold(folder) and fold(posixpath.join(parent, expected)) in taken:
         blocker = "another series/movie in the arr already uses that folder"
@@ -450,12 +456,18 @@ def check(arr: Arr, kind: Kind, item: dict, files: str | None, taken: set, names
     return Mismatch(item, expected, found, irregular, blocker, renames, unsure, ignored, skipped, count)
 
 
+def root_folders(arr: Arr) -> set:
+    """The arr's root folders, without a trailing slash."""
+    return {r["path"].rstrip("/") or "/" for r in arr.get("/api/v3/rootfolder")}
+
+
 def plan(arr: Arr, kind: Kind, files: str | None = None, ignore_tag: int | None = None, ignore_case: bool = False,
-         ignore_punctuation: bool = False):
+         ignore_punctuation: bool = False, roots: set | None = None):
     """Check every item in the arr. Returns four things: what needs renaming (a list of Mismatch),
     the items whose folder isn't on disk, the items skipped because they have the tag `ignore_tag`
-    (a tag id), and the paths of every item in lower case. The arr is read THREADS requests at a
-    time; nothing is changed here, and everything comes back in the items' order."""
+    (a tag id), and the paths of every item in lower case. `roots` are the arr's root folders (see
+    check). The arr is read THREADS requests at a time; nothing is changed here, and everything
+    comes back in the items' order."""
     items = sorted(arr.get(f"/api/v3/{kind.items}"), key=lambda i: fold(i.get("sortTitle") or i["title"]))
     windows = next((i["path"] for i in items if "\\" in i["path"] or re.match(r"[A-Za-z]:", i["path"])), None)
     if windows:  # every folder would look missing, as its path isn't split up right
@@ -474,7 +486,7 @@ def plan(arr: Arr, kind: Kind, files: str | None = None, ignore_tag: int | None 
         not_on_disk = [item for item, parent, folder in todo if folder not in listings[parent]]
         present = [(item, parent) for item, parent, folder in todo if folder in listings[parent]]
         checked = pool.map(lambda t: check(arr, kind, t[0], files, taken, listings[t[1]], ignore_case,
-                                           ignore_punctuation), present)
+                                           ignore_punctuation, roots), present)
         mismatches = [m for m in checked if m]
     return mismatches, not_on_disk, ignored, taken
 
@@ -502,8 +514,8 @@ def gone(arr: Arr, kind: Kind, item_id: int) -> bool:
     return False
 
 
-def recheck(arr: Arr, kind: Kind, m: Mismatch, files: str | None, taken: set,
-            ignore_case: bool = False, ignore_punctuation: bool = False) -> tuple[bool, Mismatch | None]:
+def recheck(arr: Arr, kind: Kind, m: Mismatch, files: str | None, taken: set, ignore_case: bool = False,
+            ignore_punctuation: bool = False, roots: set | None = None) -> tuple[bool, Mismatch | None]:
     """Refresh `m`'s item in the arr and check it again. Returns whether its folder is still on
     disk, and what needs renaming now (None if nothing does). Raises Gone if the item has been
     deleted from the arr (its refresh then fails)."""
@@ -519,7 +531,7 @@ def recheck(arr: Arr, kind: Kind, m: Mismatch, files: str | None, taken: set,
     names = listing(arr, parent)  # read again: a rename earlier in this run may have used a name
     if folder not in names:
         return False, None
-    return True, check(arr, kind, item, files, taken, names, ignore_case, ignore_punctuation)
+    return True, check(arr, kind, item, files, taken, names, ignore_case, ignore_punctuation, roots)
 
 
 def wait_for(arr: Arr, name: str | None = None, command_id: int | None = None) -> str | None:
@@ -831,8 +843,9 @@ def run(args, name: str | None, modes: str) -> int:
                                    f"Its tags: {', '.join(sorted(tags)) or 'none'}")
             ignore_tag = tags[tag_name.lower()]
             print(f"Ignoring {things} tagged {tag_name!r}")
+        roots = root_folders(arr)
         mismatches, not_on_disk, ignored, taken = plan(arr, kind, files_mode, ignore_tag, args.ignore_case,
-                                                       args.ignore_punctuation)
+                                                       args.ignore_punctuation, roots)
     except CouldntStart:
         raise
     except Exception as e:  # e.g. the arr can't be reached, refuses the API key, or sends a reply we can't read
@@ -926,7 +939,7 @@ def run(args, name: str | None, modes: str) -> int:
             last_done = None
         print("    refreshing the arr's metadata to check it still needs renaming")
         try:
-            present, fresh = recheck(arr, kind, m, files_mode, taken, args.ignore_case, args.ignore_punctuation)
+            present, fresh = recheck(arr, kind, m, files_mode, taken, args.ignore_case, args.ignore_punctuation, roots)
         except Gone:
             print(f"    GONE: deleted from {app} mid-run: skipped")
             deleted += 1
