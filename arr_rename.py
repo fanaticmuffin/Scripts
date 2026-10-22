@@ -242,8 +242,11 @@ def parse(folder: str):
 def unpunctuated(name: str) -> str:
     """`name` with its special characters (anything other than letters, digits and spaces) removed,
     except in its year and id tags, and runs of spaces made single: "What's Up! (2020)" becomes
-    "Whats Up (2020)"."""
-    return " ".join(SPECIAL.sub(lambda m: m.group(1) or "", name).split())
+    "Whats Up (2020)". An accent mark stored apart from its letter (see fold), like the one making
+    "か" into "が", is part of the letter, so it stays: "がっこう" mustn't become "かっこう"."""
+    def kept(m):  # a year or id tag, or an accent mark
+        return m.group(1) or (m.group() if unicodedata.category(m.group()).startswith("M") else "")
+    return " ".join(SPECIAL.sub(kept, name).split())
 
 
 def passed_over(folder: str, expected: str) -> tuple[str, ...]:
@@ -475,7 +478,7 @@ def recheck(arr: Arr, kind: Kind, m: Mismatch, files: str | None, taken: set,
     return True, check(arr, kind, item, files, taken, names, ignore_case, ignore_punctuation)
 
 
-def wait_for(arr: Arr, name: str = None, command_id: int = None) -> str | None:
+def wait_for(arr: Arr, name: str | None = None, command_id: int | None = None) -> str | None:
     """Wait until the arr command `command_id` has finished, or, given `name` instead, until no
     command with that name is queued or running. Returns how `command_id` ended ("completed",
     "failed", ...). Raises OSError if it still isn't done after TIMEOUT seconds, so a stuck command
@@ -601,7 +604,7 @@ def rename_files(arr: Arr, kind: Kind, item_id: int, only: set | None = None) ->
     label = ""
     if db_after != want:
         label = "RESCAN NEEDED"
-        print(f"    NEEDS REFRESH: the arr's records don't match the renamed files; refreshing")
+        print("    NEEDS REFRESH: the arr's records don't match the renamed files; refreshing")
         refresh(arr, kind, item_id)
         db_after = tracked(arr, kind, item_id)
         print(f"    REFRESHED: the arr now has {len(db_after)} files on record")
