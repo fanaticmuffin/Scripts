@@ -3,7 +3,7 @@
 
 "The arr" below means Sonarr or Radarr, whichever one the script is pointed at. It must run on
 Linux or macOS (or in Docker): the script reads the arr's paths as Linux paths, so an arr running
-on Windows isn't supported.
+on Windows isn't supported, and a run on one doesn't start.
 
 What is checked
   For each series or movie, the script asks the arr what its folder should be called (the arr's
@@ -16,7 +16,8 @@ What is checked
 
 How a folder is renamed (only with --apply or --interactive)
   1. The item is refreshed in the arr, and the script waits for that to finish. A failed refresh
-     stops the run.
+     stops the run, unless the item has been deleted from the arr in the meantime: then it's
+     skipped, and the Discord report lists it as GONE, with a ping.
   2. The item is checked again. If it no longer needs renaming, it's skipped. If the new name has
      changed, the new one is used.
   3. Half a second later, once any refresh the arr is running has finished (one running during
@@ -88,7 +89,8 @@ Settings
     DISCORD_WEBHOOK_URL           optional: post each run's results to this Discord webhook
                                   (Server Settings > Integrations > Webhooks)
     DISCORD_USER_ID               optional: your Discord user id, pinged when a run can't start or
-                                  stops, or renames need an --interactive run or were forced. Turn on
+                                  stops, renames need an --interactive run or were forced, or
+                                  something was deleted from the arr mid-run. Turn on
                                   Developer Mode (Settings > Advanced), then right-click your name >
                                   Copy User ID.
 
@@ -183,11 +185,19 @@ class Arr:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:  # add the arr's explanation: the status line alone doesn't say what's wrong
-            reason = " ".join(e.read().decode(errors="replace").split())[:300]
-            raise OSError(f"HTTP Error {e.code}: {e.reason} ({method} {endpoint})" + (f": {reason}" if reason else "")) from e
+            with e:  # (and close the reply once it's read)
+                reason = " ".join(e.read().decode(errors="replace").split())[:300]
+            hint = ", check the API key" if e.code == 401 else ""  # the arr's 401 has no explanation of its own
+            raise OSError(f"HTTP Error {e.code}: {e.reason}{hint} ({method} {endpoint})"
+                          + (f": {reason}" if reason else "")) from e
         except OSError as e:  # couldn't connect, or the connection dropped: say to which server and request
             raise OSError(f"couldn't reach {self.url} ({method} {endpoint}): {getattr(e, 'reason', e)}") from e
-        return json.loads(raw) if raw else None
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError as e:  # a web page, like a login page in front of the arr, or another app at that address
+            start = " ".join(raw[:100].decode(errors="replace").split())
+            raise OSError(f"the reply from {self.url} ({method} {endpoint}) isn't the arr's: it starts {start!r}. "
+                          "Is the URL right, with no login page in front of the arr?") from e
 
     def get(self, endpoint: str, **params):
         """Read from the arr. If it can't be reached or has a server error (as while it restarts),
@@ -196,8 +206,9 @@ class Arr:
         try:
             return self.call("GET", endpoint, params=params)
         except OSError as e:
-            if isinstance(e.__cause__, urllib.error.HTTPError) and e.__cause__.code < 500:
-                raise  # the arr refused it (wrong API key, not found, ...): trying again won't help
+            cause = e.__cause__
+            if isinstance(cause, ValueError) or isinstance(cause, urllib.error.HTTPError) and cause.code < 500:
+                raise  # the arr refused it (wrong API key, not found, ...) or isn't the arr: trying again won't help
             print(f"    {e}; trying once more in {RETRY}s")
             time.sleep(RETRY)
             return self.call("GET", endpoint, params=params)
@@ -375,7 +386,13 @@ def tba_kind(old: str, new: str, titles) -> str | None:
 
 def tba_split(arr: Arr, series_id: int, renames) -> tuple[tuple, tuple]:
     """Sort the file `renames` ((file id, old, new) each) into two groups: TBA titles being filled
-    in, and unsure ones (see tba_kind). Renames that have nothing to do with TBA are dropped."""
+    in, and unsure ones (see tba_kind). Renames that have nothing to do with TBA are dropped. The
+    episode titles are only read when an old name has a TBA in it: the arr's rename preview only
+    lists files whose name would change, so a file still waiting for its title isn't in it, and
+    most series have no TBA rename at all."""
+    renames = tuple(r for r in renames if TBA.search(posixpath.basename(r[1])))
+    if not renames:
+        return (), ()
     titles: dict[int, list] = {}
     # in season and episode order, the order Sonarr uses for a file holding several episodes
     for ep in sorted(arr.get("/api/v3/episode", seriesId=series_id),
@@ -435,6 +452,9 @@ def plan(arr: Arr, kind: Kind, files: str | None = None, ignore_tag: int | None 
     the items whose folder isn't on disk, the items skipped because they have the tag `ignore_tag`
     (a tag id), and the paths of every item in lower case."""
     items = sorted(arr.get(f"/api/v3/{kind.items}"), key=lambda i: fold(i.get("sortTitle") or i["title"]))
+    windows = next((i["path"] for i in items if "\\" in i["path"] or re.match(r"[A-Za-z]:", i["path"])), None)
+    if windows:  # every folder would look missing, as its path isn't split up right
+        raise CouldntStart(f"the arr uses Windows paths (like {windows!r}), which aren't supported")
     taken = {fold(i["path"].rstrip("/")) for i in items}
     listings: dict[str, set] = {}
     mismatches, not_on_disk, ignored = [], [], []
@@ -464,13 +484,32 @@ def refresh(arr: Arr, kind: Kind, item_id: int) -> None:
         raise OSError(f"the arr's refresh ended as {status!r}, not 'completed' (see the arr's logs)")
 
 
+class Gone(Exception):
+    """The item has been deleted from the arr since it was checked."""
+
+
+def gone(arr: Arr, kind: Kind, item_id: int) -> bool:
+    """Whether the item has been deleted from the arr: the arr answers "not found" for it."""
+    try:
+        arr.get(f"/api/v3/{kind.items}/{item_id}")
+    except OSError as e:
+        return isinstance(e.__cause__, urllib.error.HTTPError) and e.__cause__.code == 404
+    return False
+
+
 def recheck(arr: Arr, kind: Kind, m: Mismatch, files: str | None, taken: set,
             ignore_case: bool = False, ignore_punctuation: bool = False) -> tuple[bool, Mismatch | None]:
     """Refresh `m`'s item in the arr and check it again. Returns whether its folder is still on
-    disk, and what needs renaming now (None if nothing does)."""
+    disk, and what needs renaming now (None if nothing does). Raises Gone if the item has been
+    deleted from the arr (its refresh then fails)."""
     item_id = m.item["id"]
-    refresh(arr, kind, item_id)
-    item = arr.get(f"/api/v3/{kind.items}/{item_id}")
+    try:
+        refresh(arr, kind, item_id)
+        item = arr.get(f"/api/v3/{kind.items}/{item_id}")
+    except OSError:
+        if gone(arr, kind, item_id):
+            raise Gone() from None
+        raise
     parent, folder = posixpath.split(item["path"].rstrip("/"))
     names = listing(arr, parent)  # read again: a rename earlier in this run may have used a name
     if folder not in names:
@@ -542,6 +581,8 @@ def rename(arr: Arr, kind: Kind, m: Mismatch) -> tuple[bool, str]:
         return False, "FAILED"
     disk_after = on_disk(arr, new)
     left_behind = on_disk(arr, old)
+    if fold(new) == fold(old) and left_behind == disk_after:  # a capitals change on a disk that ignores capitals:
+        left_behind = set()  # the old name finds the new folder, so nothing was left behind
     if left_behind or disk_after != disk_before:
         print(f"    FAILED: files didn't all arrive in {new}. Not refreshing, because a refresh would drop "
               "the missing ones from the arr. Move them by hand, then refresh it in the arr.")
@@ -580,6 +621,7 @@ def rename_files(arr: Arr, kind: Kind, item_id: int, only: set | None = None) ->
     if not renames:
         print("    files: nothing to rename any more")
         return True, "", ()
+    wait_for(arr, kind.refresh)  # a refresh running during the renames can undo them (see rename)
     db_before = tracked(arr, kind, item_id)
     disk_before = on_disk(arr, path)
     olds = {old for old, _ in renames.values()}
@@ -672,8 +714,9 @@ def main(argv=None) -> int:
         p.add_argument("--discord-webhook", default=os.environ.get("DISCORD_WEBHOOK_URL"), metavar="URL",
                        help="post the results to this Discord webhook (default: $DISCORD_WEBHOOK_URL)")
         p.add_argument("--discord-user", default=os.environ.get("DISCORD_USER_ID"), metavar="ID",
-                       help="Discord user id to ping when a run can't start or stops, or renames need an --interactive run "
-                            "or were forced (default: $DISCORD_USER_ID)")
+                       help="Discord user id to ping when a run can't start or stops, renames need an --interactive "
+                            "run or were forced, or something was deleted from the arr mid-run "
+                            "(default: $DISCORD_USER_ID)")
     args = ap.parse_args(argv)
     if args.force and not args.apply:
         ap.error("--force only works with --apply")
@@ -762,12 +805,18 @@ def run(args, name: str | None, modes: str) -> int:
         raise CouldntStart(f"no {arr_name} URL or API key: set {prefix}_URL and {prefix}_API_KEY (e.g. in .env), "
                            "or pass --url and --api-key")
     arr = Arr(url, api_key)
+    things = "series" if args.app == "sonarr" else "movies"
     try:
-        app = arr.get("/api/v3/system/status").get("appName", "")
+        try:
+            app = arr.get("/api/v3/system/status").get("appName", "")
+        except OSError as e:
+            if isinstance(e.__cause__, urllib.error.HTTPError) and e.__cause__.code == 404:
+                raise CouldntStart(f"{url} doesn't look like {arr_name}: it has no /api/v3/system/status ({e})") from e
+            raise
         if app.lower() != args.app:
             raise CouldntStart(f"{url} is {f'{app}, ' if app else ''}not {arr_name}")
         kind = KINDS[args.app]
-        print(f"Reading {kind.items} from {app}")
+        print(f"Reading {things} from {app}")
         tag_name = args.ignore_tag or os.environ.get(f"{prefix}_IGNORE_TAG")
         ignore_tag = None
         if tag_name:
@@ -776,7 +825,7 @@ def run(args, name: str | None, modes: str) -> int:
                 raise CouldntStart(f"{app} has no tag {tag_name!r}, so nothing would be ignored. "
                                    f"Its tags: {', '.join(sorted(tags)) or 'none'}")
             ignore_tag = tags[tag_name.lower()]
-            print(f"Ignoring {kind.items} tagged {tag_name!r}")
+            print(f"Ignoring {things} tagged {tag_name!r}")
         mismatches, not_on_disk, ignored, taken = plan(arr, kind, files_mode, ignore_tag, args.ignore_case,
                                                        args.ignore_punctuation)
     except CouldntStart:
@@ -790,17 +839,24 @@ def run(args, name: str | None, modes: str) -> int:
     # The Discord entries, as (title, diff): renames left for --interactive, and renames done (in a dry run, to do)
     not_renamed, renames = [], []
 
-    def change(m: Mismatch, folder: bool, note: str = "", took_unsure: bool = False, held: bool = False) -> None:
+    def change(m: Mismatch, folder: bool, note: str = "", took_unsure: bool = False, held: bool = False,
+               gone: bool = False) -> None:
         """Add `m` to the Discord report. What gets renamed goes in `renames`, with `note` after the
         title (like " - FAILED"). What's left for --interactive goes in `not_renamed`: the whole
         item if `held` (an irregular folder that wasn't renamed), and its TBA? files unless
         `took_unsure` (they were renamed). An irregular folder's entry says what the new name
-        loses, both when it's held and when --force renamed it anyway."""
+        loses, both when it's held and when --force renamed it anyway. If `gone` (deleted from the
+        arr mid-run), `not_renamed` gets what was planned for it, none of which was done."""
         title = discord_escape(m.item["title"])
         old = posixpath.basename(m.item["path"].rstrip("/"))
         label = "TBA files:" if args.tba and not folder else "Files:"  # a renamed folder's files aren't only TBA ones
         limit = FOLDER_FILES if folder else FILES_ONLY
         pairs = lambda files: [(o, n) for _, o, n in files]  # noqa: E731
+        if gone:
+            not_renamed.append((f"{title} - GONE", discord_diff(old, m.expected if folder else old,
+                                                               [(label, pairs(m.files + m.unsure))],
+                                                               f"Deleted from {app} mid-run", limit)))
+            return
         loses = discord_escape("; ".join(m.irregular)) if folder and m.irregular else ""  # why it's irregular
         if not held and (folder or m.files or took_unsure):
             groups = [(label, pairs(m.files) + pairs(m.unsure if took_unsure and not args.force else ())),
@@ -845,7 +901,7 @@ def run(args, name: str | None, modes: str) -> int:
         ignored or as a folder that can't be renamed.)"""
         return bool(m.problems) and not m.blocker or bool(m.files or m.unsure)
 
-    renamed = declined = needs_i = not_reviewed = up_to_date = forced = 0
+    renamed = declined = needs_i = not_reviewed = up_to_date = forced = deleted = 0
     # Counts for the summary, of what was renamed (done) and what waits for --interactive (need):
     # folders, the files in those folders, items with file renames, and files renamed
     done, need = [0, 0, 0, 0], [0, 0, 0, 0]
@@ -866,6 +922,11 @@ def run(args, name: str | None, modes: str) -> int:
         print("    refreshing the arr's metadata to check it still needs renaming")
         try:
             present, fresh = recheck(arr, kind, m, files_mode, taken, args.ignore_case, args.ignore_punctuation)
+        except Gone:
+            print(f"    GONE: deleted from {app} mid-run: skipped")
+            deleted += 1
+            change(m, folder, gone=True)
+            continue
         except Exception as e:  # any error, not just connection ones: stop the run, but still send the report
             print(f"    FAILED: couldn't refresh it: {e if isinstance(e, OSError) else repr(e)}")
             change(m, folder, " - FAILED")
@@ -1002,6 +1063,8 @@ def run(args, name: str | None, modes: str) -> int:
             summary.append(f"{forced} forced")
         if up_to_date:
             summary.append(f"{up_to_date} up to date after refresh")
+        if deleted:
+            summary.append(f"{deleted} deleted from {app} mid-run")
         if not_reviewed:
             summary.append(f"{not_reviewed} not reviewed")
     summary.append(f"{sum(bool(m.blocker) for m in mismatches)} can't rename")
@@ -1043,13 +1106,16 @@ def run(args, name: str | None, modes: str) -> int:
         color = RED if stopped else GREEN if renamed else BLUE
         # renames that only an --interactive run will do: irregular folders and TBA? files
         need_i = needs_i if changing else sum(bool(m.irregular and not m.blocker or m.unsure) for m in mismatches)
-        # reasons to ping you: a problem that stopped the run, renames waiting for --interactive, and renames
-        # --force did anyway
+        # reasons to ping you: a problem that stopped the run, renames waiting for --interactive, renames
+        # --force did anyway, and items deleted from the arr mid-run
         reasons = ["the run stopped"] if stopped else []
         if need_i:
             reasons.append(f"{need_i} rename{'s' if need_i > 1 else ''} need{'s' if need_i == 1 else ''} an --interactive run")
         if forced:
             reasons.append(f"{forced} rename{'s were' if forced > 1 else ' was'} forced")
+        if deleted:
+            reasons.append(f"{deleted} {(noun if deleted == 1 else nouns).lower()} {'was' if deleted == 1 else 'were'} "
+                           f"deleted from {app} mid-run")
         ping = args.discord_user if reasons else ""
         why = "; ".join(reasons)
         # what's left for --interactive first, then what was renamed, each under a bold heading

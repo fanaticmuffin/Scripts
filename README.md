@@ -45,6 +45,6 @@ Renames that would lose information (a year, an id tag, the title) are marked **
 | `--ignore-punctuation` | Skip folders and files that only differ in special characters |
 | `--ignore-tag TAG` | Leave items with this tag alone (default: `SONARR_IGNORE_TAG` / `RADARR_IGNORE_TAG`) |
 | `--discord-webhook URL` | Post each run's report to Discord (default: `DISCORD_WEBHOOK_URL`) |
-| `--discord-user ID` | Discord user id to ping when a run can't start or stops, or something needs `-i` or was forced (default: `DISCORD_USER_ID`) |
+| `--discord-user ID` | Discord user id to ping when a run can't start or stops, something needs `-i` or was forced, or something was deleted from Sonarr/Radarr mid-run (default: `DISCORD_USER_ID`) |
 
 `--apply` and `-i` can't be combined, and neither can `--files` and `--tba`.
